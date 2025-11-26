@@ -112,7 +112,7 @@ class DockerAPI:
             resp.raise_for_status()
             return resp.json()
         except HTTPError as e:
-            # 404 = container disparu entre l’event et l’inspect : cas normal
+            # 404 => conteneur déjà disparu, cas normal sur certains events (die/destroy)
             if e.response is not None and e.response.status_code == 404:
                 return None
             raise
@@ -406,6 +406,55 @@ def network_internal_desired(
     return False
 
 
+def reattach_labelled_containers(
+    api: DockerAPI,
+    cfg: dict,
+    net_name: str,
+    reason: str,
+) -> None:
+    """Après création/recréation du réseau, rebrancher tous les conteneurs
+    qui ont le label <prefix>.<net_name>: true.
+    """
+    prefix: str = cfg["label_prefix"]
+    alias_label: str = cfg["alias_label"]
+    debug: bool = cfg["debug"]
+
+    key = f"{prefix}.{net_name}"
+
+    try:
+        containers = api.list_containers(all_containers=True)
+    except RequestException as e:
+        log(f"[{reason}] Error listing containers to reattach for network '{net_name}': {e}")
+        return
+
+    for c in containers:
+        labels = c.get("Labels") or {}
+        if not parse_bool(str(labels.get(key)), False):
+            continue
+
+        cid = c.get("Id") or c.get("ID")
+        if not isinstance(cid, str):
+            continue
+
+        names = c.get("Names") or []
+        if isinstance(names, list) and names:
+            cname = str(names[0]).lstrip("/")
+        else:
+            cname = cid[:12]
+
+        alias = labels.get(alias_label) or cname
+
+        try:
+            api.connect_network(net_name, cid, alias=alias)
+            log(f"[{reason}] Reattached labeled container '{cname}' to network '{net_name}'")
+        except RequestException as e:
+            if debug:
+                log(
+                    f"[{reason}] Failed to reattach labeled container {cid[:12]} "
+                    f"to network '{net_name}': {e}"
+                )
+
+
 def ensure_network_state(
     api: DockerAPI,
     net_name: str,
@@ -439,6 +488,8 @@ def ensure_network_state(
                 internal=internal_needed,
             )
             log(f"[{reason}] Created network '{net_name}' (internal={internal_needed})")
+            # Après création, rebrancher tous les conteneurs qui ont le label pour ce réseau
+            reattach_labelled_containers(api, cfg, net_name, reason)
         except RequestException as e:
             log(
                 f"[{reason}] Failed to create network '{net_name}' "
@@ -514,7 +565,7 @@ def ensure_network_state(
         )
         return
 
-    # Rattacher les conteneurs
+    # Rattacher les conteneurs qui étaient déjà sur ce réseau avant recréation
     for cid, cinfo in containers.items():
         if not isinstance(cid, str):
             continue
@@ -531,6 +582,9 @@ def ensure_network_state(
                 f"[{reason}] Failed to reattach container {cid} "
                 f"to network '{net_name}': {e}"
             )
+
+    # Et rebrancher tous les conteneurs qui ont le label pour ce réseau
+    reattach_labelled_containers(api, cfg, net_name, reason)
 
 
 def maybe_prune_network(
@@ -567,7 +621,6 @@ def maybe_prune_network(
         api.remove_network(network)
         log(f"[{reason}] Removed unused network '{network}'")
     except RequestException as e:
-        # Pas de spam si Docker refuse la suppression (politiques internes, etc.)
         if debug:
             log(f"[{reason}] Failed to remove unused network '{network}': {e}")
 
@@ -613,6 +666,8 @@ def reconcile_container(
         label_prefix,
     )
 
+    detach_default = parse_bool(labels.get(f"{label_prefix}.detachdefault"), False)
+
     prev_managed = managed_networks.get(container_id, set())
     # Union pour garder mémoire des réseaux déjà gérés (cas label supprimé)
     managed = set(prev_managed) | set(referenced_networks)
@@ -632,10 +687,11 @@ def reconcile_container(
             f"internal={sorted(internal_networks)}, "
             f"managed_attached={sorted(managed_attached)}, "
             f"to_connect={sorted(to_connect)}, "
-            f"to_disconnect={sorted(to_disconnect)}",
+            f"to_disconnect={sorted(to_disconnect)}, "
+            f"detach_default={detach_default}",
         )
 
-    # S'assurer de l'existence et du flag internal des réseaux concernés
+    # 1) S'assurer de l'existence + internal flag pour les réseaux concernés
     nets_to_ensure = set(desired_networks) | set(internal_networks)
     for net_name in sorted(nets_to_ensure):
         ensure_network_state(
@@ -645,7 +701,7 @@ def reconcile_container(
             reason=reason,
         )
 
-    # Attach : label truthy
+    # 2) Attach des réseaux desired
     for net_name in sorted(to_connect):
         try:
             if debug:
@@ -661,7 +717,7 @@ def reconcile_container(
                 f"[{reason}] Failed to connect '{name}' to '{net_name}': {e}",
             )
 
-    # Detach : label false ou supprimé
+    # 3) Detach des réseaux gérés plus désirés (label false ou supprimé)
     if auto_disconnect:
         for net_name in sorted(to_disconnect):
             try:
@@ -689,6 +745,45 @@ def reconcile_container(
             f"[{reason}] auto_disconnect disabled; "
             f"would disconnect from: {sorted(to_disconnect)}",
         )
+
+    # 4) Optionnel : détacher les réseaux "par défaut" de la stack
+    #    (tous les réseaux non gérés par label et non-internal)
+    if detach_default:
+        current_attached = (attached_names - to_disconnect) | to_connect
+        for net_name in sorted(current_attached):
+            if net_name in desired_networks:
+                # réseaux explicitement gérés par label -> on ne les touche pas
+                continue
+
+            info = api.inspect_network(net_name)
+            if not info:
+                continue
+            if info.get("Internal"):
+                # on ne détache pas un autre réseau internal
+                continue
+
+            try:
+                if debug:
+                    log(
+                        f"[{reason}] detachdefault: disconnecting '{name}' "
+                        f"from default/non-managed network '{net_name}'",
+                    )
+                api.disconnect_network(net_name, container_id, force=False)
+                log(
+                    f"[{reason}] detachdefault: disconnected '{name}' "
+                    f"from network '{net_name}'"
+                )
+                maybe_prune_network(
+                    api,
+                    net_name,
+                    cfg,
+                    reason=f"{reason}:prune",
+                )
+            except RequestException as e:
+                log(
+                    f"[{reason}] Failed to disconnect '{name}' "
+                    f"from default/non-managed network '{net_name}': {e}",
+                )
 
     if managed:
         managed_networks[container_id] = managed
