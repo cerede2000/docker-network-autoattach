@@ -609,7 +609,9 @@ def maybe_prune_network(
 ) -> None:
     """Prune un réseau s'il n'a plus aucun conteneur attaché.
 
-    S'applique à n'importe quel réseau Docker, pas seulement ceux créés par le watcher.
+    S'applique à n'importe quel réseau Docker, mais dans la pratique
+    nous ne l'appelons que pour des réseaux gérés par labels, pas pour
+    les réseaux 'par défaut' des stacks compose.
     """
     if not cfg.get("prune_unused_networks"):
         return
@@ -787,12 +789,8 @@ def reconcile_container(
                     f"[{reason}] detachdefault: disconnected '{name}' "
                     f"from network '{net_name}'"
                 )
-                maybe_prune_network(
-                    api,
-                    net_name,
-                    cfg,
-                    reason=f"{reason}:prune",
-                )
+                # IMPORTANT : on ne prune plus ici, pour ne pas supprimer
+                # les réseaux 'frontend_default' ou similaires utilisés par compose.
             except RequestException as e:
                 log(
                     f"[{reason}] Failed to disconnect '{name}' "
@@ -871,7 +869,7 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                     name = event.get("Actor", {}).get("Attributes", {}).get("name")
                     log(f"[event] Processing {status} for {name or cid}")
 
-                # destroy : nettoyage + prune éventuel
+                # destroy : nettoyage + prune éventuel (sur réseaux gérés uniquement)
                 if status == "destroy":
                     nets = managed_networks.pop(cid, set())
                     if cfg.get("prune_unused_networks") and nets:
