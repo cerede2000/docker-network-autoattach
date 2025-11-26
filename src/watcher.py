@@ -270,6 +270,11 @@ def load_config() -> dict:
         False,
     )
 
+    detach_other = parse_bool(
+        os.getenv("NETWORK_WATCHER_DETACH_OTHER", "false"),
+        False,
+    )
+
     log("Loaded network-watcher configuration:")
     log(f" Label prefix: {label_prefix}")
     log(f" Alias label: {alias_label}")
@@ -279,6 +284,7 @@ def load_config() -> dict:
     log(f" Debug: {debug}")
     log(f" Default network driver: {default_network_driver}")
     log(f" Prune unused networks: {prune_unused_networks}")
+    log(f" Detach other networks (global): {detach_other}")
 
     return {
         "label_prefix": label_prefix,
@@ -290,6 +296,7 @@ def load_config() -> dict:
         "debug": debug,
         "default_network_driver": default_network_driver,
         "prune_unused_networks": prune_unused_networks,
+        "detach_other": detach_other,
     }
 
 
@@ -326,7 +333,7 @@ def get_container_name(attrs: dict) -> str:
     if isinstance(names, list) and names:
         return str(names[0]).lstrip("/")
     cid = attrs.get("Id") or attrs.get("ID")
-    if isinstance(cid, str) and cid:
+    if isinstance(cid, str):
         return cid[:12]
     return "<unknown>"
 
@@ -651,6 +658,7 @@ def reconcile_container(
     alias_label: str = cfg["alias_label"]
     auto_disconnect: bool = cfg["auto_disconnect"]
     debug: bool = cfg["debug"]
+    detach_other: bool = cfg.get("detach_other", False)
 
     try:
         attrs = api.inspect_container(container_id)
@@ -704,7 +712,8 @@ def reconcile_container(
             f"managed_attached={sorted(managed_attached)}, "
             f"to_connect={sorted(to_connect)}, "
             f"to_disconnect={sorted(to_disconnect)}, "
-            f"detach_default={detach_default}",
+            f"detach_default={detach_default}, "
+            f"detach_other(global)={detach_other}",
         )
 
     # 1) S'assurer de l'existence + internal flag pour les réseaux concernés
@@ -789,13 +798,50 @@ def reconcile_container(
                     f"[{reason}] detachdefault: disconnected '{name}' "
                     f"from network '{net_name}'"
                 )
-                # IMPORTANT : on ne prune plus ici, pour ne pas supprimer
-                # les réseaux 'frontend_default' ou similaires utilisés par compose.
+                # On NE PRUNE PAS ici pour ne pas casser les stacks compose.
             except RequestException as e:
                 log(
                     f"[{reason}] Failed to disconnect '{name}' "
                     f"from default/non-managed network '{net_name}': {e}",
                 )
+
+    # 5) Mode global DETACH_OTHER : enlever tous les réseaux
+    #    qui ne sont pas explicitement listés dans les labels (desired_networks).
+    if detach_other:
+        try:
+            fresh = api.inspect_container(container_id)
+        except RequestException as e:
+            log(
+                f"[{reason}] detach_other: error re-inspecting container "
+                f"{container_id[:12]}: {e}"
+            )
+            fresh = None
+
+        if fresh:
+            fresh_name = get_container_name(fresh)
+            fresh_networks = fresh.get("NetworkSettings", {}).get("Networks", {}) or {}
+            for net_name in sorted(fresh_networks.keys()):
+                if net_name in desired_networks:
+                    continue  # on garde les réseaux demandés par labels
+
+                # On ne fait aucune distinction internal / non-internal ici :
+                # le mode DETACH_OTHER est strict : labels only.
+                try:
+                    if debug:
+                        log(
+                            f"[{reason}] detach_other: disconnecting '{fresh_name}' "
+                            f"from non-labeled network '{net_name}'",
+                        )
+                    api.disconnect_network(net_name, container_id, force=False)
+                    log(
+                        f"[{reason}] detach_other: disconnected '{fresh_name}' "
+                        f"from network '{net_name}'"
+                    )
+                except RequestException as e:
+                    log(
+                        f"[{reason}] detach_other: failed to disconnect '{fresh_name}' "
+                        f"from '{net_name}': {e}"
+                    )
 
     if managed:
         managed_networks[container_id] = managed
