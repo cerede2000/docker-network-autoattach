@@ -565,15 +565,23 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
             for event in api.events_stream(filters=filters):
                 if event.get("Type") != "container":
                     continue
+
                 status = event.get("status") or event.get("Action")
                 if status not in relevant_statuses:
                     continue
+
                 cid = event.get("id") or event.get("Actor", {}).get("ID")
                 if not isinstance(cid, str):
                     continue
 
-                if status in {"destroy", "die"}:
-                    # Récupère les réseaux que nous gérions pour ce conteneur
+                if debug:
+                    name = event.get("Actor", {}).get("Attributes", {}).get("name")
+                    log(f"[event] Processing {status} for {name or cid}")
+
+                # Cas particulier : destroy
+                # Le conteneur n'existe plus, donc pas de reconcile_container,
+                # mais on peut tenter le prune des réseaux que nous gérions.
+                if status == "destroy":
                     nets = managed_networks.pop(cid, set())
                     if cfg.get("prune_unused_networks") and nets:
                         for net_name in sorted(nets):
@@ -581,13 +589,13 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                                 api,
                                 net_name,
                                 cfg,
-                                reason=f"event:{status}:prune",
+                                reason="event:destroy:prune",
                             )
+                    # On passe au prochain event, pas d'inspect container sur un ID détruit.
+                    continue
 
-                if debug:
-                    name = event.get("Actor", {}).get("Attributes", {}).get("name")
-                    log(f"[event] Processing {status} for {name or cid}")
-
+                # Pour die/stop/start/update/... on laisse le cache tranquille
+                # (le conteneur peut redémarrer), et on recalcule l'état.
                 reconcile_container(api, cid, cfg, reason=f"event:{status}")
         except ReadTimeout:
             if debug:
