@@ -1,183 +1,327 @@
-# Docker Network Watcher
+# docker-network-watcher
 
-`docker-network-watcher` is a small sidecar service that automatically attaches and detaches Docker networks to containers based on labels.
+A small sidecar container that automatically **attaches / detaches Docker networks to containers** based on **labels**, using the **Docker HTTP API** (via a Socket Proxy).  
+There is **no direct access to `/var/run/docker.sock`** from inside the watcher.
 
-It is designed to:
+Typical use cases:
 
-- Work **against the Docker HTTP API** (no direct `/var/run/docker.sock` mount).
-- Be used safely behind a **Docker Socket Proxy**.
-- Let you declaratively manage container network membership with simple labels like:
-
-```yaml
-labels:
-  network-watcher.traefik: "true"
-  network-watcher.cloudflare: "false"
-````
+- Automatically plug your apps into shared networks (e.g. `traefikfront`, `socketproxy`, `psu`, `smtp`…)
+- Create networks on demand when a label is present
+- Flip networks between **internal** and **non-internal** based on labels
+- Optionally **prune unused networks**
+- Optionally enforce a **“labels-only”** network model for some or all containers
 
 ---
 
-## How it works
+## How it works (high level)
 
-The watcher connects to the Docker Engine API over HTTP (typically via a socket proxy):
+1. The watcher connects to the Docker API via `DOCKER_HOST` (HTTP / TCP, usually a [Socket Proxy](https://github.com/traefik/traefik-library-image/tree/master/traefik#using-docker-socket-proxy)).
+2. It subscribes to Docker **events** (`create`, `start`, `die`, `destroy`, `update`, …) and optionally performs **periodic rescans**.
+3. For each container that has labels matching a configurable prefix (default: `network-watcher`), it:
+   - Reads labels like `network-watcher.<network>` to know which networks to **attach** or **detach**
+   - Ensures those networks **exist**, creating them if needed
+   - Applies internal mode based on `network-watcher.<network>.internal`
+   - Optionally **detaches other networks** (depending on global / per-container settings)
+   - Optionally **prunes unused networks** when they are no longer used by any container
 
-* It discovers the API version dynamically via `/version`.
-* It listens to Docker **events** (`create`, `start`, `update`, `stop`, `destroy`, …).
-* It periodically rescans containers (optional) to stay in sync.
+Containers with **no `network-watcher.*` labels** are left alone.
 
-For each container:
-
-1. It reads labels matching a configurable prefix (default: `network-watcher.`).
-2. For each label of the form `<prefix>.<network-name>=<value>`:
-
-   * If the value is truthy (`"true"`, `"1"`, `"yes"`, `"on"`), it **attaches** the container to the Docker network `<network-name>`.
-   * If the value is falsy (`"false"`, `"0"`, `"no"`, `"off"`) or the label is removed, it **detaches** the container from `<network-name>` (if `AUTO_DISCONNECT` is enabled).
-3. An optional alias label lets you control the network alias of the container on those networks.
-
-The watcher maintains a small in-memory cache per container to handle label removal (i.e. “this label used to exist, now it’s gone → detach”).
-
-> ⚠️ Containers using `network_mode: host` or `network_mode: container:<id>` are ignored (Docker doesn’t allow attaching extra networks in those modes).
-
----
-
-## Network auto-create and pruning
-
-### Auto-create networks
-
-If a label references a network that does **not** exist yet, the watcher can automatically create it:
-
-```yaml
-labels:
-  network-watcher.my-custom-net: "true"
-```
-
-When reconciling:
-
-* It checks whether the network `my-custom-net` exists.
-* If not, it calls the Docker API to **create** it with the configured driver (`NETWORK_WATCHER_NETWORK_DRIVER`, default: `bridge`).
-* Then it attaches the container to that newly created network.
-
-This lets you declare networks purely via labels, without having to manually define them up-front in Compose or CLI.
-
-### Auto-prune unused networks
-
-When `AUTO_DISCONNECT` is enabled and all containers managed by the watcher are detached from a given network, you can optionally ask the watcher to automatically **remove** the now-unused network:
-
-* After disconnecting the last managed container from a network, if `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS=true`:
-
-  * The watcher inspects the network.
-  * If **no containers** are attached, it calls Docker to **remove** that network.
-
-This is useful to avoid accumulation of ephemeral networks created only for short-lived containers.
-
-> Note: pruning is best-effort and only happens as part of the watcher’s own attach/detach logic. It does not periodically scan all networks on its own.
+The watcher **never breaks its own connectivity**: it detects its own container ID and does not apply the “detach other” logic to itself.
 
 ---
 
 ## Labels
 
-By default, the label prefix is `network-watcher`.
-A label key is built as:
+By default, the label prefix is `network-watcher`. You can change it via `NETWORK_WATCHER_PREFIX`.
 
-```text
-<prefix>.<network-name>
-```
-
-Example:
+### 1. Attach / detach a network
 
 ```yaml
 labels:
-  network-watcher.traefik: "true"
-  network-watcher.cloudflare: "false"
-```
+  network-watcher.traefikfront: "true"
+  network-watcher.psu: "true"
+  network-watcher.smtp: "false"
+````
 
-Behavior:
+For a given prefix `<prefix>`:
 
-* `network-watcher.traefik: "true"`
-  → Ensure the container is attached to the Docker network **`traefik`** (creating it first if necessary).
-* `network-watcher.cloudflare: "false"`
-  → Ensure the container is **detached** from the Docker network **`cloudflare`**.
-* Removing `network-watcher.traefik` entirely
-  → The watcher will detect that and **detach** the container from `traefik` (with `AUTO_DISCONNECT=true`).
-  If this was the last container on that network and `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS=true`, the network may also be removed.
+* `<prefix>.<network>: "true"`
+  → ensure the container is attached to the Docker network `<network>`.
+* `<prefix>.<network>: "false"` or label removed
+  → ensure the container is **detached** from `<network>` (if previously managed).
 
-### Alias label
+The watcher will also **create the network** if it does not exist yet, using the configured driver and internal mode (see below).
 
-You can optionally define a network alias for all managed networks via an alias label:
+### 2. Internal networks
 
 ```yaml
 labels:
-  network-watcher.traefik: "true"
-  network-watcher.alias: "my-service"
+  network-watcher.psu: "true"
+  network-watcher.psu.internal: "true"
 ```
 
-By default, the alias label key is `<prefix>.alias`, e.g. `network-watcher.alias`.
+For each network name `<net>`:
 
-If not set, the alias falls back to the container name.
+* `<prefix>.<net>.internal: "true"` → this network should be **internal**
+* No container with `<prefix>.<net>.internal: "true"` → this network should be **non-internal**
 
----
+The watcher:
 
-## Environment variables
+* Inspects the Docker network `<net>`
+* If it does not exist, it **creates** it with:
 
-| Variable                                | Default                    | Description                                                                                                             |
-| --------------------------------------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `DOCKER_HOST`                           | `http://socket-proxy:2375` | URL of the Docker Engine / Socket Proxy (must be HTTP/HTTPS, no `unix://` sockets).                                     |
-| `NETWORK_WATCHER_PREFIX`                | `network-watcher`          | Prefix used for labels (e.g. `network-watcher.traefik=true`).                                                           |
-| `NETWORK_WATCHER_ALIAS_LABEL`           | `<prefix>.alias`           | Label key used for alias (e.g. `network-watcher.alias`).                                                                |
-| `INITIAL_ATTACH`                        | `true`                     | If `true`, reconcile all existing containers at startup.                                                                |
-| `INITIAL_RUNNING_ONLY`                  | `false`                    | If `true`, only reconcile containers that are currently running at startup.                                             |
-| `AUTO_DISCONNECT`                       | `true`                     | If `true`, detach from networks when label is falsy or removed.                                                         |
-| `RESCAN_SECONDS`                        | `30`                       | Periodic full rescan interval in seconds. Set to `0` to disable periodic rescan.                                        |
-| `DEBUG`                                 | `false`                    | If `true`, print verbose debug logs about decisions (attach/detach, desired vs actual state, etc.).                     |
-| `NETWORK_WATCHER_NETWORK_DRIVER`        | `bridge`                   | Docker network driver to use when **auto-creating** networks (e.g. `bridge`, `overlay`, depending on your environment). |
-| `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS` | `false`                    | If `true`, automatically remove networks that have **no containers** attached after disconnecting the last one.         |
+  * `Driver`: `NETWORK_WATCHER_NETWORK_DRIVER` (default: `bridge`)
+  * `Internal`: `true` or `false` depending on labels
+* If it already exists but the `Internal` flag does not match, it:
 
-Truthy values: `1`, `true`, `yes`, `y`, `on`
-Falsy values: `0`, `false`, `no`, `n`, `off`
+  * Detaches all containers from that network
+  * Deletes the network
+  * Recreates it with the correct `Internal` setting + same driver
+  * Reattaches:
 
----
+    * All containers that were previously attached
+    * All containers having `<prefix>.<net>: "true"` labels
 
-## Usage
+> This works for **any Docker network**, not only those originally created by the watcher.
 
-### 1. With Docker Socket Proxy
-
-It is strongly recommended to use a socket proxy instead of exposing `/var/run/docker.sock` directly to the watcher.
-
-The repository provides a sample Docker Compose file that:
-
-* Runs a socket proxy (e.g. `lscr.io/linuxserver/socket-proxy`).
-* Runs the `network-watcher` container.
-* Connects the watcher to the proxy via `DOCKER_HOST`.
-
-👉 See the sample compose file:
-[`docker-compose.sample.yml`](./docker-compose.sample.yml)
-
-### 2. Example label usage
+### 3. Alias label
 
 ```yaml
+labels:
+  network-watcher.psu: "true"
+  network-watcher.alias: "my-custom-alias"
+```
+
+By default, if you don’t configure anything, the watcher uses the container name as the network alias.
+You can override this with:
+
+* Env: `NETWORK_WATCHER_ALIAS_LABEL` (default: `<prefix>.alias`)
+* Label: `<prefix>.alias: "<alias>"`
+
+### 4. Per-container detach behaviour (`detachdefault`)
+
+```yaml
+labels:
+  network-watcher.traefikfront: "true"
+  network-watcher.socketproxy: "true"
+  network-watcher.detachdefault: "false"
+```
+
+Role of `detachdefault` depends on the **global** setting `NETWORK_WATCHER_DETACH_OTHER`:
+
+#### Global OFF (default: `NETWORK_WATCHER_DETACH_OTHER=false`)
+
+* No `network-watcher.detachdefault` label → do **not** touch other networks.
+* `network-watcher.detachdefault: "true"` → this container is in **labels-only** mode:
+
+  * Attach networks declared via labels
+  * Detach all **other** networks (even if they are not “default” ones)
+
+#### Global ON (`NETWORK_WATCHER_DETACH_OTHER=true`)
+
+* Default behaviour: all containers with labels are considered **labels-only**:
+
+  * Attach networks declared via labels
+  * Detach all other networks
+* `network-watcher.detachdefault: "false"` → **opt-out** for this container:
+
+  * It keeps its other networks untouched
+* `network-watcher.detachdefault: "true"` → explicitly confirmed labels-only (same as default when global is ON)
+
+> The watcher container itself is never affected by `detachdefault` or `NETWORK_WATCHER_DETACH_OTHER` to avoid cutting off its own Docker API connectivity.
+
+---
+
+## Environment variables (watcher container)
+
+### Connection
+
+* `DOCKER_HOST`
+  **Required.** Must point to a Docker HTTP/TCP endpoint, typically a Socket Proxy.
+
+  Examples:
+
+  * `DOCKER_HOST=http://socket-proxy:2375`
+  * `DOCKER_HOST=tcp://socket-proxy:2375`
+
+  `unix://` is **not** supported.
+
+### Core behaviour
+
+* `NETWORK_WATCHER_PREFIX`
+  Default: `network-watcher`
+  Prefix for all labels.
+
+* `NETWORK_WATCHER_ALIAS_LABEL`
+  Default: `<prefix>.alias`
+  Label key used to fetch a custom network alias for containers.
+
+* `INITIAL_ATTACH`
+  Default: `"true"`
+  If `true`, the watcher runs an initial pass on existing containers when it starts.
+
+* `INITIAL_RUNNING_ONLY`
+  Default: `"false"`
+  If `true`, the initial pass only considers running containers; otherwise, all containers.
+
+* `AUTO_DISCONNECT`
+  Default: `"true"`
+  If `true`, the watcher disconnects networks that are no longer desired (e.g. when label is set to `false` or removed).
+
+* `RESCAN_SECONDS`
+  Default: `"30"`
+  Interval for periodic rescans.
+
+  * `0` or negative → periodic rescan disabled.
+
+* `DEBUG`
+  Default: `"false"`
+  If `true`, prints verbose logs about decisions (desired networks, detach decisions, etc.).
+
+### Network creation / pruning
+
+* `NETWORK_WATCHER_NETWORK_DRIVER`
+  Default: `"bridge"`
+  Driver to use when creating new Docker networks (`docker network create --driver <driver>`).
+
+* `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS`
+  Default: `"false"`
+  If `true`, the watcher removes networks that it manages and that have **no containers attached** anymore.
+  It only attempts to prune networks that it has managed via labels.
+
+### Global “labels-only” mode
+
+* `NETWORK_WATCHER_DETACH_OTHER`
+  Default: `"false"`
+
+  Controls whether containers with labels should be in **labels-only** mode:
+
+  * `false`:
+
+    * No `detachdefault` → **do not** touch other networks.
+    * `network-watcher.detachdefault: "true"` → labels-only **for this container**.
+  * `true`:
+
+    * By default, containers with labels are labels-only (detach other networks).
+    * `network-watcher.detachdefault: "false"` → opt-out: keep other networks.
+    * `network-watcher.detachdefault: "true"` → explicit opt-in (same as default).
+
+> The watcher container (the one running this script) is **never** subject to `detachdefault` or `NETWORK_WATCHER_DETACH_OTHER`.
+
+### Build metadata (optional)
+
+* `WATCHER_BUILD_HASH`
+  Optional. If set (typically from your CI with `git rev-parse --short HEAD`), it is printed on startup:
+
+  ```text
+  Starting docker-network-watcher (build=abcd123)
+  ```
+
+---
+
+## Behaviour summary
+
+* The watcher only touches containers that:
+
+  * have at least one label starting with `<prefix>.`, **or**
+  * have previously been managed (stored in its internal `managed_networks` set).
+* Containers with no `network-watcher.*` labels are **ignored**.
+* For each labelled container:
+
+  * Networks with `<prefix>.<net>: "true"` are **ensured and attached**.
+  * Networks with `<prefix>.<net>: "false"` or where the label was removed are **detached** (if `AUTO_DISCONNECT=true`).
+  * Networks with `<prefix>.<net>.internal: "true"` are forced to be Docker `internal` networks; others are forced to be non-internal.
+  * Optionally, other networks are detached according to:
+
+    * Global `NETWORK_WATCHER_DETACH_OTHER`
+    * Per-container `network-watcher.detachdefault`
+* If `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS=true`, networks that the watcher manages and that have no containers attached are **removed**.
+
+---
+
+## Docker Compose example
+
+A minimal example with a Socket Proxy and the watcher:
+
+```yaml
+version: "3.9"
+
+networks:
+  socketproxy:
+    name: socketproxy
+  traefikfront:
+    name: traefikfront
+
 services:
-  myapp:
-    image: nginx:alpine
-    labels:
-      # Attach myapp to 'traefik' network (auto-created if needed)
-      network-watcher.traefik: "true"
-      # Make sure it's NOT attached to 'cloudflare'
-      network-watcher.cloudflare: "false"
-      # Optional: override alias on all managed networks
-      network-watcher.alias: "myapp-nginx"
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    container_name: socket-proxy
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      EVENTS: 1
+      # ...adjust permissions as you like...
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socketproxy
+    restart: unless-stopped
+
+  network-watcher:
+    image: ghcr.io/your-user/docker-network-watcher:latest
+    container_name: network-watcher
+    environment:
+      DOCKER_HOST: http://socket-proxy:2375
+      NETWORK_WATCHER_PREFIX: network-watcher
+      NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS: "true"
+      NETWORK_WATCHER_DETACH_OTHER: "true"   # global labels-only, overridable per container
+      RESCAN_SECONDS: "30"
+    networks:
+      - socketproxy
+    restart: unless-stopped
 ```
 
-You can flip labels at any time and the watcher will attach/detach networks accordingly:
+An example app container:
 
-* Change `network-watcher.cloudflare` from `"false"` to `"true"` → the watcher will connect `myapp` to the `cloudflare` network (creating it if needed).
-* Remove `network-watcher.traefik` entirely → the watcher will detach `myapp` from `traefik`, and (with `NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS=true`) may remove the `traefik` network if it’s now unused.
+```yaml
+  my-app:
+    image: your/image
+    container_name: my-app
+    labels:
+      network-watcher.traefikfront: "true"
+      network-watcher.psu: "true"
+      network-watcher.psu.internal: "true"
+      # This app is in labels-only mode even if the global DETACH_OTHER is false:
+      network-watcher.detachdefault: "true"
+    networks:
+      - traefikfront   # initial compose networks, watcher will reconcile according to labels
+    restart: unless-stopped
+```
 
 ---
 
-## Design notes
+## Sample compose file
 
-* Works with Docker 29+ (API version detection via `/version`).
-* Uses only the Docker **HTTP API**: no dependency on the Docker CLI inside the container.
-* Can **auto-create** networks on demand, with a configurable driver.
-* Can **auto-prune** unused networks when the last managed container is detached.
-* Stateless by design: all “state” is derived from Docker + a small in-memory cache for label tracking.
-* Safe to restart: on startup, the watcher re-evaluates containers according to the current labels.
+You can find a complete example in this repository:
+**[`docker-compose.sample.yml`](./compose.yml)**
+
+Use it as a starting point and adapt:
+
+* network names (e.g. `traefikfront`, `psu`, `socketproxy`, …),
+* which containers should be in labels-only mode,
+* whether you want global `NETWORK_WATCHER_DETACH_OTHER` or only per-container `detachdefault`.
+
+---
+
+## Notes & limitations
+
+* Requires Docker API v1.52 (Docker 29) or compatible. The watcher auto-detects the API version from `/version` and falls back to `v1.52` on error.
+* Only works over HTTP(S)/TCP (`DOCKER_HOST=http://...` or `tcp://...`), not over Unix sockets.
+* Designed to be **read-only** on Docker objects except:
+
+  * attaching / detaching containers to networks,
+  * creating networks,
+  * deleting/recreating networks when toggling internal mode,
+  * pruning unused networks (if enabled).
+
+If you run into edge cases or want to support more advanced patterns (e.g. driver-specific options on network creation), feel free to open an issue or extend the labels model.
