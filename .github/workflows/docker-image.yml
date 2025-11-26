@@ -3,7 +3,9 @@ name: Build and publish Docker image
 on:
   push:
     branches: [ "main" ]
-  workflow_dispatch: {}
+    paths:
+      - watcher.py      # ✅ ne déclenche que si ce fichier change
+  workflow_dispatch: {} # tu peux toujours le lancer à la main si besoin
 
 env:
   # L'image sera ghcr.io/OWNER/REPO
