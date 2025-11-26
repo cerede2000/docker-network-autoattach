@@ -38,6 +38,7 @@ managed_networks: Dict[str, Set[str]] = {}
 # networks that were auto-created by the watcher (eligible for prune)
 auto_created_networks: Set[str] = set()
 
+
 # ---------------------------------------------------------
 # Docker HTTP client
 # ---------------------------------------------------------
@@ -59,7 +60,10 @@ class DockerAPI:
             log(f"Detected Docker API version {api_version}")
             return f"/v{api_version}"
         except Exception as e:  # noqa: BLE001
-            log(f"WARNING: failed to detect Docker API version ({e}); falling back to v1.52")
+            log(
+                f"WARNING: failed to detect Docker API version ({e}); "
+                "falling back to v1.52"
+            )
             return "/v1.52"
 
     def _url(self, path: str) -> str:
@@ -97,7 +101,8 @@ class DockerAPI:
             timeout=timeout or self.timeout,
         )
 
-    # High-level helpers
+    # ---------- High-level container helpers ----------
+
     def list_containers(self, all_containers: bool = True) -> list[dict]:
         params = {"all": "1" if all_containers else "0"}
         resp = self._get("/containers/json", params=params)
@@ -133,11 +138,9 @@ class DockerAPI:
 
     # ---------- Network helpers ----------
 
-    # ---------- Network helpers ----------
-
     def _find_networks_by_name(self, name: str) -> list[dict]:
         """
-        Use /networks?filters={"name":["name"]} and then filter on exact match
+        Use /networks?filters={"name":["name"]} then filter on exact match
         on Name or Id to avoid partial matches (Docker 'name' filter is fuzzy).
         """
         params = {"filters": json.dumps({"name": [name]})}
@@ -161,7 +164,6 @@ class DockerAPI:
         except RequestException:
             return False
         return len(nets) > 0
-
 
     def create_network(self, name: str, driver: str | None = None) -> dict:
         payload: dict = {
@@ -199,14 +201,12 @@ class DockerAPI:
         resp = self._delete(f"/networks/{net_id}")
         resp.raise_for_status()
 
-
     # ---------- Events ----------
 
     def events_stream(self, filters: dict | None = None):
         params = {}
         if filters:
             params["filters"] = json.dumps(filters)
-        # Long-poll; reconnect on timeout.
         resp = self._get("/events", params=params, stream=True, timeout=60)
         resp.raise_for_status()
         for line in resp.iter_lines(decode_unicode=True):
@@ -355,6 +355,7 @@ def extract_desired_networks(
 
     return desired, referenced
 
+
 def maybe_prune_network(
     api: DockerAPI,
     network: str,
@@ -396,6 +397,7 @@ def maybe_prune_network(
         auto_created_networks.discard(network)
     except RequestException as e:
         log(f"[{reason}] Failed to remove unused network '{network}': {e}")
+
 
 def reconcile_container(
     api: DockerAPI,
@@ -557,6 +559,7 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
 # Event loop + periodic rescan
 # ---------------------------------------------------------
 
+
 def event_loop(api: DockerAPI, cfg: dict) -> None:
     relevant_statuses = {
         "create",
@@ -590,9 +593,9 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                     name = event.get("Actor", {}).get("Attributes", {}).get("name")
                     log(f"[event] Processing {status} for {name or cid}")
 
-                # Cas particulier : destroy
-                # Le conteneur n'existe plus, donc pas de reconcile_container,
-                # mais on peut tenter le prune des réseaux que nous gérions.
+                # Special case: destroy
+                # The container no longer exists, so don't call reconcile_container,
+                # but we can attempt pruning for networks we were managing for it.
                 if status == "destroy":
                     nets = managed_networks.pop(cid, set())
                     if cfg.get("prune_unused_networks") and nets:
@@ -603,11 +606,11 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                                 cfg,
                                 reason="event:destroy:prune",
                             )
-                    # On passe au prochain event, pas d'inspect container sur un ID détruit.
+                    # No inspect on a destroyed container.
                     continue
 
-                # Pour die/stop/start/update/... on laisse le cache tranquille
-                # (le conteneur peut redémarrer), et on recalcule l'état.
+                # For other statuses (die, stop, start, update, ...),
+                # do a normal reconciliation.
                 reconcile_container(api, cid, cfg, reason=f"event:{status}")
         except ReadTimeout:
             if debug:
@@ -619,6 +622,7 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
             log(f"Unexpected error in event loop: {e}")
         log("Re-establishing Docker event stream in 5 seconds...")
         time.sleep(5)
+
 
 def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
     interval = cfg["rescan_seconds"]
