@@ -12,7 +12,7 @@ RUN adduser -D -u 1000 watcher
 WORKDIR /app
 
 # Copier uniquement le strict nécessaire
-COPY watcher.py /app/watcher.py
+COPY src/watcher.py /app/watcher.py
 
 # Installer la seule dépendance dont on a besoin
 RUN pip install --no-cache-dir requests
