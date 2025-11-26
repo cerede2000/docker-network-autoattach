@@ -15,6 +15,7 @@ from requests.exceptions import RequestException, ReadTimeout
 # Logging helpers
 # ---------------------------------------------------------
 
+
 def log(msg: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -56,11 +57,7 @@ class DockerAPI:
             log(f"Detected Docker API version {api_version}")
             return f"/v{api_version}"
         except Exception as e:  # noqa: BLE001
-            # Fallback to Docker 29 API version which is 1.52 today
-            log(
-                f"WARNING: failed to detect Docker API version ({e}); "
-                "falling back to v1.52"
-            )
+            log(f"WARNING: failed to detect Docker API version ({e}); falling back to v1.52")
             return "/v1.52"
 
     def _url(self, path: str) -> str:
@@ -132,23 +129,27 @@ class DockerAPI:
         resp = self._post(f"/networks/{network}/disconnect", payload)
         resp.raise_for_status()
 
-    def inspect_network(self, network: str) -> dict:
-        resp = self._get(f"/networks/{network}")
+    # ---------- Network helpers ----------
+
+    def _find_networks_by_name(self, name: str) -> list[dict]:
+        """
+        Use /networks?filters={"name":["name"]} which is robust and
+        works well with name-based lookups.
+        """
+        params = {"filters": json.dumps({"name": [name]})}
+        resp = self._get("/networks", params=params)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        if not isinstance(data, list):
+            return []
+        return data
 
     def network_exists(self, network: str) -> bool:
         try:
-            resp = self._get(f"/networks/{network}")
+            nets = self._find_networks_by_name(network)
         except RequestException:
             return False
-        if resp.status_code == 404:
-            return False
-        try:
-            resp.raise_for_status()
-        except RequestException:
-            return False
-        return True
+        return len(nets) > 0
 
     def create_network(self, name: str, driver: str | None = None) -> dict:
         payload: dict = {
@@ -161,15 +162,39 @@ class DockerAPI:
         resp.raise_for_status()
         return resp.json()
 
+    def inspect_network(self, network: str) -> dict | None:
+        """
+        Inspect by name; /networks?filters=name returns detailed network objects
+        including Containers.
+        """
+        try:
+            nets = self._find_networks_by_name(network)
+        except RequestException:
+            return None
+        if not nets:
+            return None
+        return nets[0]
+
     def remove_network(self, network: str) -> None:
-        resp = self._delete(f"/networks/{network}")
+        """
+        Remove by resolving name -> Id, then DELETE /networks/{id}.
+        """
+        nets = self._find_networks_by_name(network)
+        if not nets:
+            return
+        net_id = nets[0].get("Id") or nets[0].get("ID")
+        if not isinstance(net_id, str):
+            return
+        resp = self._delete(f"/networks/{net_id}")
         resp.raise_for_status()
+
+    # ---------- Events ----------
 
     def events_stream(self, filters: dict | None = None):
         params = {}
         if filters:
             params["filters"] = json.dumps(filters)
-        # Keep the stream open; use a larger read timeout so we can reconnect if idle.
+        # Long-poll; reconnect on timeout.
         resp = self._get("/events", params=params, stream=True, timeout=60)
         resp.raise_for_status()
         for line in resp.iter_lines(decode_unicode=True):
@@ -330,11 +355,10 @@ def maybe_prune_network(
 
     debug: bool = cfg["debug"]
 
-    try:
-        info = api.inspect_network(network)
-    except RequestException as e:
+    info = api.inspect_network(network)
+    if info is None:
         if debug:
-            log(f"[{reason}] Failed to inspect network '{network}' for pruning: {e}")
+            log(f"[{reason}] Network '{network}' not found when trying to prune.")
         return
 
     containers = info.get("Containers") or {}
@@ -494,6 +518,9 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
     except RequestException as e:
         log(f"Error listing containers during initial attach: {e}")
         return
+
+    if cfg["debug"]:
+        log(f"Initial attach: found {len(containers)} container(s).")
 
     for c in containers:
         cid = c.get("Id") or c.get("ID")
