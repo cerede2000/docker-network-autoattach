@@ -92,6 +92,13 @@ class DockerAPI:
             timeout=timeout or self.timeout,
         )
 
+    def _delete(self, path: str, timeout: int | None = None) -> Response:
+        url = self._url(path)
+        return requests.delete(
+            url,
+            timeout=timeout or self.timeout,
+        )
+
     # High-level helpers
     def list_containers(self, all_containers: bool = True) -> list[dict]:
         params = {"all": "1" if all_containers else "0"}
@@ -132,9 +139,8 @@ class DockerAPI:
         return resp.json()
 
     def network_exists(self, network: str) -> bool:
-        url = self._url(f"/networks/{network}")
         try:
-            resp = requests.get(url, timeout=self.timeout)
+            resp = self._get(f"/networks/{network}")
         except RequestException:
             return False
         if resp.status_code == 404:
@@ -157,8 +163,7 @@ class DockerAPI:
         return resp.json()
 
     def remove_network(self, network: str) -> None:
-        url = self._url(f"/networks/{network}")
-        resp = requests.delete(url, timeout=self.timeout)
+        resp = self._delete(f"/networks/{network}")
         resp.raise_for_status()
 
     def events_stream(self, filters: dict | None = None):
@@ -344,4 +349,275 @@ def maybe_prune_network(
 
     try:
         api.remove_network(network)
-        log(f"[{reason]()
+        log(f"[{reason}] Removed unused network '{network}'")
+    except RequestException as e:
+        log(f"[{reason}] Failed to remove unused network '{network}': {e}")
+
+
+def reconcile_container(
+    api: DockerAPI,
+    container_id: str,
+    cfg: dict,
+    reason: str = "event",
+) -> None:
+    label_prefix: str = cfg["label_prefix"]
+    alias_label: str = cfg["alias_label"]
+    auto_disconnect: bool = cfg["auto_disconnect"]
+    debug: bool = cfg["debug"]
+    default_network_driver: str = cfg["default_network_driver"]
+
+    try:
+        attrs = api.inspect_container(container_id)
+    except RequestException as e:
+        log(f"[{reason}] Error inspecting container {container_id}: {e}")
+        return
+
+    name = get_container_name(attrs)
+
+    net_mode = get_network_mode(attrs)
+    if net_mode and (net_mode == "host" or net_mode.startswith("container:")):
+        if debug:
+            log(
+                f"[{reason}] Skipping '{name}': network_mode={net_mode} "
+                "— cannot attach/detach networks."
+            )
+        return
+
+    labels = attrs.get("Config", {}).get("Labels", {}) or {}
+    networks = attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
+
+    desired_networks, referenced_networks = extract_desired_networks(
+        labels,
+        label_prefix,
+    )
+
+    prev_managed = managed_networks.get(container_id, set())
+    # Union so we remember networks that were referenced in the past for
+    # label-removal handling.
+    managed = set(prev_managed) | set(referenced_networks)
+
+    # Networks currently attached that we consider "managed" for this container
+    attached_names = set(networks.keys())
+    managed_attached = attached_names & managed
+
+    to_connect = desired_networks - managed_attached
+    to_disconnect = managed_attached - desired_networks
+
+    alias = labels.get(alias_label) or name
+
+    if debug:
+        log(
+            f"[{reason}] {name}: desired={sorted(desired_networks)}, "
+            f"managed_attached={sorted(managed_attached)}, "
+            f"to_connect={sorted(to_connect)}, "
+            f"to_disconnect={sorted(to_disconnect)}",
+        )
+
+    # Attach networks whose label value is truthy
+    for net_name in sorted(to_connect):
+        try:
+            if not api.network_exists(net_name):
+                if debug:
+                    log(
+                        f"[{reason}] Network '{net_name}' does not exist; "
+                        f"creating with driver '{default_network_driver}'",
+                    )
+                api.create_network(net_name, driver=default_network_driver)
+                log(f"[{reason}] Created network '{net_name}'")
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to ensure existence of network "
+                f"'{net_name}': {e}",
+            )
+            continue
+
+        try:
+            if debug:
+                log(
+                    f"[{reason}] Connecting '{name}' to '{net_name}' "
+                    f"with alias '{alias}'"
+                )
+            api.connect_network(net_name, container_id, alias=alias)
+            log(f"Connecting '{name}' to network '{net_name}'")
+            managed.add(net_name)
+        except RequestException as e:
+            log(
+                f"[{reason}] Failed to connect '{name}' to '{net_name}': {e}",
+            )
+
+    # Detach networks that are managed but no longer desired (label false or removed)
+    if auto_disconnect:
+        for net_name in sorted(to_disconnect):
+            try:
+                if debug:
+                    log(
+                        f"[{reason}] Disconnecting '{name}' "
+                        f"from '{net_name}'",
+                    )
+                api.disconnect_network(net_name, container_id, force=False)
+                log(f"Disconnecting '{name}' from network '{net_name}'")
+                managed.discard(net_name)
+                maybe_prune_network(
+                    api,
+                    net_name,
+                    cfg,
+                    reason=f"{reason}:prune",
+                )
+            except RequestException as e:
+                log(
+                    f"[{reason}] Failed to disconnect '{name}' "
+                    f"from '{net_name}': {e}",
+                )
+    elif debug and to_disconnect:
+        log(
+            f"[{reason}] auto_disconnect disabled; "
+            f"would disconnect from: {sorted(to_disconnect)}",
+        )
+
+    if managed:
+        managed_networks[container_id] = managed
+    elif container_id in managed_networks:
+        managed_networks.pop(container_id, None)
+
+
+def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
+    if not cfg["initial_attach"]:
+        log("Initial attach disabled by configuration.")
+        return
+
+    running_only = cfg["initial_running_only"]
+    log(
+        f"Running initial attach (containers: "
+        f"{'running only' if running_only else 'all'})...",
+    )
+    try:
+        containers = api.list_containers(all_containers=not running_only)
+    except RequestException as e:
+        log(f"Error listing containers during initial attach: {e}")
+        return
+
+    for c in containers:
+        cid = c.get("Id") or c.get("ID")
+        if not isinstance(cid, str):
+            continue
+        reconcile_container(api, cid, cfg, reason="initial")
+
+    log("Initial attach complete.")
+
+
+# ---------------------------------------------------------
+# Event loop + periodic rescan
+# ---------------------------------------------------------
+
+
+def event_loop(api: DockerAPI, cfg: dict) -> None:
+    relevant_statuses = {
+        "create",
+        "start",
+        "restart",
+        "die",
+        "stop",
+        "destroy",
+        "update",
+        "rename",
+    }
+    debug: bool = cfg["debug"]
+    filters = {"type": ["container"]}
+
+    log("Event loop started.")
+    while True:
+        try:
+            for event in api.events_stream(filters=filters):
+                if event.get("Type") != "container":
+                    continue
+                status = event.get("status") or event.get("Action")
+                if status not in relevant_statuses:
+                    continue
+                cid = event.get("id") or event.get("Actor", {}).get("ID")
+                if not isinstance(cid, str):
+                    continue
+
+                if status in {"destroy", "die"}:
+                    # Best-effort cleanup of our local cache
+                    managed_networks.pop(cid, None)
+
+                if debug:
+                    name = event.get("Actor", {}).get("Attributes", {}).get("name")
+                    log(f"[event] Processing {status} for {name or cid}")
+
+                reconcile_container(api, cid, cfg, reason=f"event:{status}")
+        except ReadTimeout:
+            # Normal when idle; just re-open the stream.
+            if debug:
+                log("Event stream read timeout; reopening...")
+            continue
+        except RequestException as e:
+            log(f"Error in event loop HTTP call: {e}")
+        except Exception as e:  # noqa: BLE001
+            log(f"Unexpected error in event loop: {e}")
+        log("Re-establishing Docker event stream in 5 seconds...")
+        time.sleep(5)
+
+
+def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
+    interval = cfg["rescan_seconds"]
+    debug: bool = cfg["debug"]
+
+    if interval <= 0:
+        log("Periodic rescan disabled.")
+        return
+
+    log(f"Periodic rescan thread started (interval {interval} seconds).")
+
+    while True:
+        time.sleep(interval)
+        if debug:
+            log("Periodic rescan: scanning containers.")
+        try:
+            containers = api.list_containers(all_containers=True)
+        except RequestException as e:
+            log(f"Error listing containers for rescan: {e}")
+            continue
+
+        for c in containers:
+            cid = c.get("Id") or c.get("ID")
+            if not isinstance(cid, str):
+                continue
+            reconcile_container(api, cid, cfg, reason="rescan")
+
+
+# ---------------------------------------------------------
+# Main entry
+# ---------------------------------------------------------
+
+
+def main() -> None:
+    base_url = get_base_url_from_env()
+    log(f"Connecting to Docker Engine via HTTP at: {base_url}")
+
+    try:
+        api = DockerAPI(base_url=base_url)
+    except Exception as e:  # noqa: BLE001
+        log(f"Failed to create Docker HTTP client: {e}")
+        sys.exit(1)
+
+    cfg = load_config()
+
+    # Initial reconciliation of existing containers
+    initial_attach_all(api, cfg)
+
+    # Periodic rescan thread
+    if cfg["rescan_seconds"] > 0:
+        t = threading.Thread(
+            target=periodic_rescan_loop,
+            args=(api, cfg),
+            daemon=True,
+        )
+        t.start()
+
+    # Event loop (blocking)
+    event_loop(api, cfg)
+
+
+if __name__ == "__main__":
+    main()
