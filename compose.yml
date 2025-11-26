@@ -18,8 +18,10 @@ services:
     container_name: network-watcher
     environment:
       - DOCKER_HOST=tcp://socket-proxy:2375
-      - NETWORK_WATCHER_PREFIX=network-watcher
       # Options :
+      - NETWORK_WATCHER_PREFIX=network-watcher
+      - NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS=true
+      - NETWORK_WATCHER_NETWORK_DRIVER=bridge
       - INITIAL_ATTACH=true          # attache au démarrage du watcher
       - INITIAL_RUNNING_ONLY=false   # true = uniquement conteneurs "running"
       - AUTO_DISCONNECT=true         # détache si false ou label supprimé
