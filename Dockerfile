@@ -1,10 +1,12 @@
 FROM python:3.12-alpine
 
 # Build-time arg, avec valeur par défaut pour les builds locaux
-ARG GIT_COMMIT=dev
+ARG GIT_COMMIT=unknown
+ARG WATCHER_VERSION=dev
 
 # Réduire les writes & la verbosité de pip
-ENV WATCHER_BUILD_HASH=$GIT_COMMIT \
+ENV WATCHER_BUILD_HASH="${GIT_COMMIT}" \
+    WATCHER_VERSION="${WATCHER_VERSION}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
