@@ -1151,8 +1151,9 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
 
 
 def main() -> None:
+    version = os.getenv("WATCHER_VERSION", "dev")
     build_hash = os.getenv("WATCHER_BUILD_HASH", "unknown")
-    log(f"Starting docker-network-watcher (build={build_hash})")
+    log(f"Starting docker-network-watcher v{version} (build={build_hash})")
 
     base_url = get_base_url_from_env()
     log(f"Connecting to Docker Engine via HTTP at: {base_url}")
