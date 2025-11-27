@@ -213,6 +213,20 @@ class DockerAPI:
         resp = self._delete(f"/networks/{net_id}")
         resp.raise_for_status()
 
+    def list_networks(self, filters: dict | None = None) -> list[dict]:
+        """
+        Liste tous les réseaux Docker (optionnellement filtrés).
+        """
+        params: dict = {}
+        if filters:
+            params["filters"] = json.dumps(filters)
+        resp = self._get("/networks", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        return []
+
     # ---------- Events ----------
 
     def events_stream(self, filters: dict | None = None):
@@ -270,6 +284,11 @@ def load_config() -> dict:
         False,
     )
 
+    prune_orphan_networks = parse_bool(
+        os.getenv("NETWORK_WATCHER_PRUNE_ORPHAN_NETWORKS", "false"),
+        False,
+    )
+
     detach_other = parse_bool(
         os.getenv("NETWORK_WATCHER_DETACH_OTHER", "false"),
         False,
@@ -285,7 +304,8 @@ def load_config() -> dict:
     log(f" Periodic rescan seconds: {rescan_seconds} (0 = disabled)")
     log(f" Debug: {debug}")
     log(f" Default network driver: {default_network_driver}")
-    log(f" Prune unused networks: {prune_unused_networks}")
+    log(f" Prune unused networks (managed): {prune_unused_networks}")
+    log(f" Prune orphan networks (global): {prune_orphan_networks}")
     log(f" Detach other networks (global): {detach_other}")
     log(f" Self container id (HOSTNAME): {self_id or '<unknown>'}")
 
@@ -299,6 +319,7 @@ def load_config() -> dict:
         "debug": debug,
         "default_network_driver": default_network_driver,
         "prune_unused_networks": prune_unused_networks,
+        "prune_orphan_networks": prune_orphan_networks,
         "detach_other": detach_other,
         "self_container_id": self_id,
     }
@@ -616,7 +637,7 @@ def maybe_prune_network(
     cfg: dict,
     reason: str = "prune",
 ) -> None:
-    """Prune un réseau s'il n'a plus aucun conteneur attaché."""
+    """Prune un réseau s'il n'a plus aucun conteneur attaché (réseaux gérés)."""
     if not cfg.get("prune_unused_networks"):
         return
 
@@ -643,6 +664,74 @@ def maybe_prune_network(
     except RequestException as e:
         if debug:
             log(f"[{reason}] Failed to remove unused network '{network}': {e}")
+
+
+def is_system_network(net: dict) -> bool:
+    """
+    Retourne True si le réseau est un réseau système Docker
+    qu'on ne doit jamais supprimer automatiquement.
+    """
+    name = net.get("Name") or ""
+    if not isinstance(name, str):
+        name = str(name)
+
+    # Réseaux système classiques
+    if name in {"bridge", "host", "none", "docker_gwbridge"}:
+        return True
+
+    # Réseaux ingress swarm
+    if net.get("Ingress"):
+        return True
+    if name == "ingress":
+        return True
+
+    return False
+
+
+def prune_orphan_networks(
+    api: DockerAPI,
+    cfg: dict,
+    reason: str = "prune-orphans",
+) -> None:
+    """
+    Prune globalement les réseaux orphelins :
+    - aucun conteneur connecté
+    - pas un réseau système Docker
+    Activé via NETWORK_WATCHER_PRUNE_ORPHAN_NETWORKS.
+    """
+    if not cfg.get("prune_orphan_networks"):
+        return
+
+    debug: bool = cfg["debug"]
+
+    try:
+        networks = api.list_networks()
+    except RequestException as e:
+        log(f"[{reason}] Error listing networks: {e}")
+        return
+
+    for net in networks:
+        if not isinstance(net, dict):
+            continue
+        name = net.get("Name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        if is_system_network(net):
+            if debug:
+                log(f"[{reason}] Skipping system network '{name}'")
+            continue
+
+        containers = net.get("Containers") or {}
+        if containers:
+            continue
+
+        try:
+            api.remove_network(name)
+            log(f"[{reason}] Removed orphan network '{name}'")
+        except RequestException as e:
+            if debug:
+                log(f"[{reason}] Failed to remove orphan network '{name}': {e}")
 
 
 # ---------------------------------------------------------
@@ -954,6 +1043,9 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
             continue
         reconcile_container(api, cid, cfg, reason="initial")
 
+    # Prune global des réseaux orphelins après l'initial attach (si activé)
+    prune_orphan_networks(api, cfg, reason="initial:orphans")
+
     log("Initial attach complete.")
 
 
@@ -1040,6 +1132,9 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
             if not isinstance(cid, str):
                 continue
             reconcile_container(api, cid, cfg, reason="rescan")
+
+        # Prune global des réseaux orphelins à chaque rescan (si activé)
+        prune_orphan_networks(api, cfg, reason="rescan:orphans")
 
 
 # ---------------------------------------------------------
