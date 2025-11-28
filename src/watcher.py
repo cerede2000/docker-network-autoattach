@@ -32,6 +32,31 @@ def parse_bool(value: Optional[str], default: bool = False) -> bool:
     return default
 
 
+def parse_aliases(raw: Optional[str], fallback: str) -> List[str]:
+    """
+    Parse the alias label into a list of aliases.
+
+    Examples:
+      - None or ""  -> [fallback]
+      - "my-service" -> ["my-service"]
+      - "alias1,alias2" -> ["alias1", "alias2"]
+      - "alias1; alias2, alias3" -> ["alias1", "alias2", "alias3"]
+    """
+    if raw is None:
+        return [fallback]
+
+    text = str(raw).strip()
+    if not text:
+        return [fallback]
+
+    # Allow both ',' and ';' as separators
+    text = text.replace(";", ",")
+    parts = [p.strip() for p in text.split(",")]
+    aliases = [p for p in parts if p]
+
+    return aliases or [fallback]
+
+
 # container_id -> set of network names we manage for this container
 managed_networks: Dict[str, Set[str]] = {}
 
@@ -106,16 +131,25 @@ class DockerAPI:
         return resp.json()
 
     def connect_network(
-        self, network: str, container_id: str, alias: Optional[str] = None
+        self,
+        network: str,
+        container_id: str,
+        aliases: Optional[List[str]] = None,
     ) -> None:
+        """
+        Connect a container to a network, optionally with one or more aliases.
+        """
         payload: dict = {"Container": container_id}
-        if alias:
-            payload["EndpointConfig"] = {"Aliases": [alias]}
+        if aliases:
+            payload["EndpointConfig"] = {"Aliases": aliases}
         resp = self._post(f"/networks/{network}/connect", payload)
         resp.raise_for_status()
 
     def disconnect_network(
-        self, network: str, container_id: str, force: bool = False
+        self,
+        network: str,
+        container_id: str,
+        force: bool = False,
     ) -> None:
         payload: dict = {"Container": container_id, "Force": force}
         resp = self._post(f"/networks/{network}/disconnect", payload)
@@ -184,7 +218,6 @@ def load_config() -> dict:
         "NETWORK_WATCHER_ALIAS_LABEL",
         f"{label_prefix}.alias",
     ).strip()
-
     detach_override_label = os.getenv(
         "NETWORK_WATCHER_DETACH_OVERRIDE_LABEL",
         f"{label_prefix}.detachdefault",
@@ -213,7 +246,6 @@ def load_config() -> dict:
         os.getenv("NETWORK_WATCHER_PRUNE_UNUSED_NETWORKS", "true"),
         True,
     )
-
     prune_orphan = parse_bool(
         os.getenv("NETWORK_WATCHER_PRUNE_ORPHAN_NETWORKS", "false"),
         False,
@@ -241,7 +273,7 @@ def load_config() -> dict:
     if self_id_prefix:
         log(f" Self container id prefix: {self_id_prefix}")
     else:
-        log(" Self container id prefix: <none> (probably running outside Docker)")
+        log(" Self container id prefix:  (probably running outside Docker)")
 
     return {
         "label_prefix": label_prefix,
@@ -295,7 +327,7 @@ def get_container_name(attrs: dict) -> str:
     cid = attrs.get("Id") or attrs.get("ID")
     if isinstance(cid, str) and cid:
         return cid[:12]
-    return "<unknown>"
+    return ""
 
 
 def get_network_mode(attrs: dict) -> Optional[str]:
@@ -326,7 +358,8 @@ def extract_desired_networks(
     regardless of the value, so we can later detach when label is removed.
 
     We treat keys of the form:
-      <prefix>.<network> = true/false
+      <prefix>.<network>= true/false
+
     and ignore:
       <prefix>.alias
       <prefix>.detachdefault
@@ -373,21 +406,25 @@ def extract_internal_preferences(
     Only networks that have an explicit .internal label are returned.
     """
     result: Dict[str, bool] = {}
+
     prefix = f"{label_prefix}."
     for key, value in labels.items():
         if not isinstance(key, str):
             continue
         if not key.startswith(prefix):
             continue
-        suffix = key[len(prefix) :]
 
+        suffix = key[len(prefix) :]
         if not suffix.endswith(".internal"):
             continue
+
         base_name = suffix[: -len(".internal")].strip()
         if not base_name:
             continue
+
         desired_internal = parse_bool(str(value), False)
         result[base_name] = desired_internal
+
     return result
 
 
@@ -415,6 +452,7 @@ def compute_referenced_networks(
         cid = c.get("Id") or c.get("ID")
         if not isinstance(cid, str):
             continue
+
         try:
             attrs = api.inspect_container(cid)
         except RequestException:
@@ -529,15 +567,13 @@ def ensure_network_exists_and_compatible(
             f"{'internal' if desired_internal else 'non-internal'} (driver={driver})."
         )
     except RequestException as e:
-        log(
-            f"[{reason}:internal] Failed to recreate network '{net_name}': {e}"
-        )
+        log(f"[{reason}:internal] Failed to recreate network '{net_name}': {e}")
         return False
 
     # Reattach containers (best-effort, without alias knowledge here)
     for cid in attached_cids:
         try:
-            api.connect_network(net_name, cid, alias=None)
+            api.connect_network(net_name, cid, aliases=None)
         except RequestException as e:
             log(
                 f"[{reason}:internal] Failed to reattach container {cid} "
@@ -714,14 +750,17 @@ def reconcile_container(
     to_connect = desired_networks - managed_attached
     to_disconnect = managed_attached - desired_networks
 
-    alias = labels.get(alias_label) or name
+    # --- NEW: multi-alias support ---
+    raw_alias = labels.get(alias_label)
+    aliases = parse_aliases(raw_alias, fallback=name)
 
     if debug:
         log(
             f"[{reason}] {name}: desired={sorted(desired_networks)}, "
             f"managed_attached={sorted(managed_attached)}, "
             f"to_connect={sorted(to_connect)}, "
-            f"to_disconnect={sorted(to_disconnect)}",
+            f"to_disconnect={sorted(to_disconnect)}, "
+            f"aliases={aliases}"
         )
 
     # First ensure networks exist / have proper internal flag for any network we might touch
@@ -741,9 +780,9 @@ def reconcile_container(
             if debug:
                 log(
                     f"[{reason}] Connecting '{name}' to '{net_name}' "
-                    f"with alias '{alias}'"
+                    f"with aliases {aliases}"
                 )
-            api.connect_network(net_name, container_id, alias=alias)
+            api.connect_network(net_name, container_id, aliases=aliases)
             log(f"Connecting '{name}' to network '{net_name}'")
             managed.add(net_name)
         except RequestException as e:
@@ -786,8 +825,10 @@ def reconcile_container(
     if detach_other:
         # Recompute attached networks (approximate: including newly connected, minus disconnected)
         effective_attached = (attached_names | to_connect) - to_disconnect
+
         # Keep all networks that are referenced by labels; detach the rest.
         to_detach_other = effective_attached - referenced_networks
+
         for net_name in sorted(to_detach_other):
             if net_name in SYSTEM_NETWORKS:
                 continue
@@ -820,6 +861,7 @@ def initial_attach_all(api: DockerAPI, cfg: dict) -> None:
         f"Running initial attach (containers: "
         f"{'running only' if running_only else 'all'})...",
     )
+
     try:
         containers = api.list_containers(all_containers=not running_only)
     except RequestException as e:
@@ -860,9 +902,11 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
             for event in api.events_stream(filters=filters):
                 if event.get("Type") != "container":
                     continue
+
                 status = event.get("status") or event.get("Action")
                 if status not in relevant_statuses:
                     continue
+
                 cid = event.get("id") or event.get("Actor", {}).get("ID")
                 if not isinstance(cid, str):
                     continue
@@ -870,6 +914,7 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                 if status in {"destroy", "die"}:
                     # Best-effort cleanup of our local cache
                     prev_managed = managed_networks.pop(cid, set())
+
                     # On container destroy, we may also prune networks we were managing
                     if status == "destroy" and cfg["prune_unused_networks"]:
                         # We pass containers_cache=None so compute_referenced_networks
@@ -890,13 +935,12 @@ def event_loop(api: DockerAPI, cfg: dict) -> None:
                 reconcile_container(api, cid, cfg, reason=f"event:{status}")
         except ReadTimeout:
             # Normal when idle; just re-open the stream.
-            if debug:
-                log("Event stream read timeout; reopening...")
             continue
         except RequestException as e:
             log(f"Error in event loop HTTP call: {e}")
         except Exception as e:  # noqa: BLE001
             log(f"Unexpected error in event loop: {e}")
+
         log("Re-establishing Docker event stream in 5 seconds...")
         time.sleep(5)
 
@@ -927,7 +971,7 @@ def periodic_rescan_loop(api: DockerAPI, cfg: dict) -> None:
                 continue
             reconcile_container(api, cid, cfg, reason="rescan")
 
-        # Global orphan prune if enabled
+        # Also prune orphan networks if enabled, using same container cache
         prune_orphan_networks(api, cfg, reason="rescan:orphans", containers_cache=containers)
 
 
@@ -940,15 +984,6 @@ def main() -> None:
     base_url = get_base_url_from_env()
     log(f"Connecting to Docker Engine via HTTP at: {base_url}")
 
-    # Version / build info for easier debugging
-    version = os.getenv("WATCHER_VERSION", "dev").strip()
-    build_hash = (
-        os.getenv("WATCHER_BUILD_HASH")
-        or os.getenv("GIT_COMMIT")
-        or "unknown"
-    ).strip()
-    log(f"Starting docker-network-watcher v{version} (build={build_hash})")
-
     try:
         api = DockerAPI(base_url=base_url)
     except Exception as e:  # noqa: BLE001
@@ -956,6 +991,11 @@ def main() -> None:
         sys.exit(1)
 
     cfg = load_config()
+
+    # Optionally log watcher version (can be injected at build time)
+    watcher_version = os.getenv("WATCHER_VERSION", "").strip()
+    if watcher_version:
+        log(f"docker-network-autoattach watcher version: {watcher_version}")
 
     # Initial reconciliation of existing containers
     initial_attach_all(api, cfg)
