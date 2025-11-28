@@ -400,6 +400,7 @@ def extract_desired_networks(
     and ignore:
       <prefix>.alias
       <prefix>.detachdefault
+      <prefix>.disablenetwork
       <prefix>.<network>.internal
     """
     desired: Set[str] = set()
@@ -415,7 +416,7 @@ def extract_desired_networks(
         suffix = key[len(prefix) :]
 
         # Ignore special keys
-        if suffix == "alias" or suffix == "detachdefault":
+        if suffix in ("alias", "detachdefault", "disablenetwork"):
             continue
         if suffix.endswith(".internal"):
             continue
@@ -768,6 +769,42 @@ def reconcile_container(
         if debug:
             log(f"[{reason}] Skipping '{name}': no {label_prefix}.* labels.")
         return
+
+    # --------------------------------------------------
+    # New: global "disable all networks" label
+    #   label: <prefix>.disablenetwork = true
+    #   -> on détache tous les réseaux du conteneur
+    # --------------------------------------------------
+    disable_label_key = f"{label_prefix}.disablenetwork"
+    disable_network = parse_bool(
+        str(labels.get(disable_label_key)) if disable_label_key in labels else None,
+        False,
+    )
+
+    if disable_network:
+        attached_all = set(networks.keys())
+        if attached_all:
+            for net_name in sorted(attached_all):
+                try:
+                    api.disconnect_network(net_name, container_id, force=False)
+                    log(
+                        f"[{reason}] disablenetwork: disconnected '{name}' "
+                        f"from network '{net_name}'"
+                    )
+                except RequestException as e:
+                    log(
+                        f"[{reason}] disablenetwork: failed to disconnect "
+                        f"'{name}' from '{net_name}': {e}"
+                    )
+
+        # Ce conteneur est explicitement sans réseau géré.
+        if container_id in managed_networks:
+            managed_networks.pop(container_id, None)
+
+        # On ne fait pas le reste de la logique (pas d'attach, pas de detach_other)
+        return
+
+    # --- logique normale si disablenetwork n'est pas actif ---
 
     desired_networks, referenced_networks = extract_desired_networks(
         labels,
