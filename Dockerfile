@@ -21,7 +21,7 @@ WORKDIR /app
 COPY src/watcher.py /app/watcher.py
 
 # Installer la seule dépendance dont on a besoin
-RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir requests requests-unixsocket
 
 USER watcher
 
