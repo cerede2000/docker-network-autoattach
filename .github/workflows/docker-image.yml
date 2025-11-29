@@ -1,77 +1,74 @@
-name: Build and publish Docker image
+name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ main ]
-    paths:
-      - src/watcher.py
+    branches:
+      - go
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - go
   workflow_dispatch:
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
-    # Important pour GHCR + delete-package-versions
+jobs:
+  build:
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
       id-token: write
 
-    env:
-      REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository }}
-      # Tu peux changer la base quand tu veux repartir sur une nouvelle série
-      BASE_VERSION: "0.1"
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Normalize image & package name
-        run: |
-          echo "IMAGE_NAME_LOWER=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
-          echo "PKG_NAME=$(basename '${{ env.IMAGE_NAME }}')" >> $GITHUB_ENV
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Compute image version and tags
-        id: meta
-        shell: bash
-        run: |
-          SHORT_SHA="${GITHUB_SHA::7}"
-
-          # Version auto-incrémentale: BASE_VERSION.run_number
-          VERSION="${BASE_VERSION}.${GITHUB_RUN_NUMBER}"
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-          TAGS="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:${VERSION},"
-          TAGS+="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:sha-${SHORT_SHA},"
-          TAGS+="${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:latest"
-
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-
-          echo "Computed version: ${VERSION}"
-          echo "Image tags: ${TAGS}"
-
-      - name: Log in to GHCR
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          build-args: |
-            GIT_COMMIT=${{ github.sha }}
-            WATCHER_VERSION=${{ steps.meta.outputs.version }}
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
 
-      - name: Prune old container versions (keep last 3)
-        uses: actions/delete-package-versions@v5
+      - name: Generate artifact attestation
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
         with:
-          package-name: ${{ env.PKG_NAME }}
-          package-type: container
-          min-versions-to-keep: 3
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
