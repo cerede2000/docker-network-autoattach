@@ -1,4 +1,4 @@
-module docker-network-manager
+module github.com/cerede2000/docker-network-autoattach
 
 go 1.21
 
