@@ -20,18 +20,20 @@ import (
 )
 
 const (
-	defaultLabelPrefix          = "managed.network."
-	defaultDisconnectDefaultKey = "disconnectdefault"
-	defaultInternalKey          = "internal"
+	defaultLabelPrefix           = "managed.network."
+	defaultDisconnectDefaultKey  = "disconnectdefault"
+	defaultInternalKey           = "internal"
+	defaultReconciliationInterval = 30 * time.Second // Réconciliation toutes les 30 secondes
 )
 
 type NetworkManager struct {
-	client              *client.Client
-	labelPrefix         string
-	disconnectDefaultKey string
-	internalKey         string
-	mu                  sync.RWMutex
-	managedContainers   map[string]bool // Track containers we're managing
+	client                 *client.Client
+	labelPrefix            string
+	disconnectDefaultKey   string
+	internalKey            string
+	reconciliationInterval time.Duration
+	mu                     sync.RWMutex
+	managedContainers      map[string]bool // Track containers we're managing
 }
 
 func main() {
@@ -48,18 +50,21 @@ func main() {
 	labelPrefix := getEnv("LABEL_PREFIX", defaultLabelPrefix)
 	disconnectDefaultKey := getEnv("DISCONNECT_DEFAULT_KEY", defaultDisconnectDefaultKey)
 	internalKey := getEnv("INTERNAL_KEY", defaultInternalKey)
+	reconciliationInterval := getDurationEnv("RECONCILIATION_INTERVAL", defaultReconciliationInterval)
 
 	log.Printf("Configuration:")
 	log.Printf("  Label prefix: %s", labelPrefix)
-	log.Printf("  Disconnect default key: %s%s", labelPrefix, disconnectDefaultKey)
-	log.Printf("  Internal network key: %s%s", labelPrefix, internalKey)
+	log.Printf("  Disconnect default label: %s%s", labelPrefix, disconnectDefaultKey)
+	log.Printf("  Internal network suffix: .%s", internalKey)
+	log.Printf("  Reconciliation interval: %v", reconciliationInterval)
 
 	manager := &NetworkManager{
-		client:              cli,
-		labelPrefix:         labelPrefix,
-		disconnectDefaultKey: disconnectDefaultKey,
-		internalKey:         internalKey,
-		managedContainers:   make(map[string]bool),
+		client:                 cli,
+		labelPrefix:            labelPrefix,
+		disconnectDefaultKey:   disconnectDefaultKey,
+		internalKey:            internalKey,
+		reconciliationInterval: reconciliationInterval,
+		managedContainers:      make(map[string]bool),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -81,7 +86,10 @@ func main() {
 		log.Printf("Warning: Initial reconciliation failed: %v", err)
 	}
 
-	// Start watching for container events
+	// Start periodic reconciliation loop
+	go manager.periodicReconciliation(ctx)
+
+	// Start watching for container events (for immediate reactions)
 	log.Println("Starting event watcher...")
 	if err := manager.watchEvents(ctx); err != nil {
 		log.Fatalf("Event watcher failed: %v", err)
@@ -90,19 +98,56 @@ func main() {
 	log.Println("Docker Network Manager stopped")
 }
 
+func (m *NetworkManager) periodicReconciliation(ctx context.Context) {
+	ticker := time.NewTicker(m.reconciliationInterval)
+	defer ticker.Stop()
+
+	log.Printf("Starting periodic reconciliation loop (every %v)", m.reconciliationInterval)
+
+	for {
+		select {
+		case <-ticker.C:
+			log.Println("Running periodic reconciliation...")
+			if err := m.reconcileAllContainers(ctx); err != nil {
+				log.Printf("Periodic reconciliation error: %v", err)
+			}
+		case <-ctx.Done():
+			log.Println("Stopping periodic reconciliation")
+			return
+		}
+	}
+}
+
 func (m *NetworkManager) reconcileAllContainers(ctx context.Context) error {
 	containers, err := m.client.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	log.Printf("Found %d containers to reconcile", len(containers))
+	log.Printf("Found %d containers to check", len(containers))
+
+	managedCount := 0
+	skippedCount := 0
+	errorCount := 0
 
 	for _, c := range containers {
 		if err := m.reconcileContainer(ctx, c.ID); err != nil {
 			log.Printf("Error reconciling container %s: %v", c.ID[:12], err)
+			errorCount++
+		} else {
+			// Check if it was managed
+			m.mu.RLock()
+			if m.managedContainers[c.ID] {
+				managedCount++
+			} else {
+				skippedCount++
+			}
+			m.mu.RUnlock()
 		}
 	}
+
+	log.Printf("Reconciliation complete: %d managed, %d skipped, %d errors", 
+		managedCount, skippedCount, errorCount)
 
 	return nil
 }
@@ -139,6 +184,8 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		// Give Docker a moment to fully start the container
 		time.Sleep(500 * time.Millisecond)
 		
+		log.Printf("Event: %s for container %s", event.Action, event.ID[:12])
+		
 		if err := m.reconcileContainer(ctx, event.ID); err != nil {
 			log.Printf("Error handling event for container %s: %v", event.ID[:12], err)
 		}
@@ -146,6 +193,7 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		m.mu.Lock()
 		delete(m.managedContainers, event.ID)
 		m.mu.Unlock()
+		log.Printf("Container %s stopped, removed from managed list", event.ID[:12])
 	}
 }
 
@@ -156,6 +204,8 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		return fmt.Errorf("failed to inspect container: %w", err)
 	}
 
+	containerName := containerInfo.Name
+	
 	// Skip if container is not running
 	if !containerInfo.State.Running {
 		return nil
@@ -168,10 +218,14 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	
 	// If no network labels, skip management
 	if len(networkLabels) == 0 {
+		m.mu.Lock()
+		delete(m.managedContainers, containerID)
+		m.mu.Unlock()
 		return nil
 	}
 
-	log.Printf("Managing container %s (%s)", containerInfo.Name, containerID[:12])
+	log.Printf("Managing container %s (%s) - Networks: %v", 
+		containerName, containerID[:12], getNetworkNames(networkLabels))
 
 	// Track this container
 	m.mu.Lock()
@@ -203,23 +257,26 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 			}
 		}
 		
-		// Mark as managed
+		// Mark as managed (remove from currentNetworks)
 		delete(currentNetworks, netName)
 	}
 
 	// Disconnect from networks that are no longer in labels
+	// currentNetworks now contains only networks NOT in labels
 	for netName := range currentNetworks {
-		// Check if this is a default network and we should keep it
-		if m.isDefaultNetwork(netName, containerInfo) && !shouldDisconnectDefault {
+		isDefault := m.isDefaultNetwork(netName, containerInfo)
+		
+		// Skip default networks if we shouldn't disconnect them
+		if isDefault && !shouldDisconnectDefault {
 			continue
 		}
 
-		// Disconnect if it was previously managed or if we should disconnect default
-		if shouldDisconnectDefault && m.isDefaultNetwork(netName, containerInfo) {
-			log.Printf("Disconnecting container %s from default network %s", containerID[:12], netName)
-			if err := m.client.NetworkDisconnect(ctx, netName, containerID, false); err != nil {
-				log.Printf("Error disconnecting container %s from network %s: %v", containerID[:12], netName, err)
-			}
+		// Disconnect this network
+		log.Printf("Disconnecting container %s from network %s (default: %v)", 
+			containerID[:12], netName, isDefault)
+		if err := m.client.NetworkDisconnect(ctx, netName, containerID, false); err != nil {
+			log.Printf("Error disconnecting container %s from network %s: %v", 
+				containerID[:12], netName, err)
 		}
 	}
 
@@ -265,18 +322,6 @@ func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]stri
 	return networks
 }
 
-// Legacy function kept for backward compatibility
-func (m *NetworkManager) extractNetworkLabels(labels map[string]string) map[string]bool {
-	networks := make(map[string]bool)
-	networksWithInternal := m.extractNetworkLabelsWithInternal(labels)
-	
-	for netName := range networksWithInternal {
-		networks[netName] = true
-	}
-	
-	return networks
-}
-
 func (m *NetworkManager) shouldDisconnectDefault(labels map[string]string) bool {
 	key := m.labelPrefix + m.disconnectDefaultKey
 	value, exists := labels[key]
@@ -285,7 +330,6 @@ func (m *NetworkManager) shouldDisconnectDefault(labels map[string]string) bool 
 
 func (m *NetworkManager) isDefaultNetwork(netName string, containerInfo types.ContainerJSON) bool {
 	// Default networks are typically named after the compose project or "bridge"
-	// We'll consider it default if it matches the compose project or is "bridge"
 	if netName == "bridge" || netName == "host" || netName == "none" {
 		return true
 	}
@@ -339,7 +383,8 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 	currentlyInternal := existingNetwork.Internal
 	
 	if currentlyInternal != shouldBeInternal {
-		log.Printf("Network %s needs internal flag conversion: %v -> %v", networkName, currentlyInternal, shouldBeInternal)
+		log.Printf("Network %s needs internal flag conversion: %v -> %v", 
+			networkName, currentlyInternal, shouldBeInternal)
 		
 		// Get detailed network info to see connected containers
 		netDetails, err := m.client.NetworkInspect(ctx, existingNetwork.ID, network.InspectOptions{})
@@ -355,7 +400,8 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 
 		// If there are containers, we need to handle them carefully
 		if len(containersToReconnect) > 0 {
-			log.Printf("Network %s has %d connected containers, preparing safe conversion...", networkName, len(containersToReconnect))
+			log.Printf("Network %s has %d connected containers, preparing safe conversion...", 
+				networkName, len(containersToReconnect))
 			
 			// Create temporary bridge network as safety net
 			tempNetworkName := "temp-safety-" + networkName
@@ -370,7 +416,6 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 			})
 			if err != nil {
 				log.Printf("Warning: Failed to create temporary network: %v", err)
-				// Continue anyway, containers might have other networks
 			}
 
 			// Connect all containers to temp network first
@@ -378,7 +423,8 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 				for _, containerID := range containersToReconnect {
 					log.Printf("Connecting container %s to temporary network", containerID[:12])
 					if err := m.client.NetworkConnect(ctx, tempNet.ID, containerID, nil); err != nil {
-						log.Printf("Warning: Failed to connect container %s to temp network: %v", containerID[:12], err)
+						log.Printf("Warning: Failed to connect container %s to temp network: %v", 
+							containerID[:12], err)
 					}
 				}
 			}
@@ -445,4 +491,25 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
+	if value := os.Getenv(key); value != "" {
+		if duration, err := time.ParseDuration(value); err == nil {
+			return duration
+		}
+	}
+	return defaultValue
+}
+
+func getNetworkNames(networks map[string]bool) []string {
+	names := make([]string, 0, len(networks))
+	for name, isInternal := range networks {
+		if isInternal {
+			names = append(names, name+" (internal)")
+		} else {
+			names = append(names, name)
+		}
+	}
+	return names
 }
