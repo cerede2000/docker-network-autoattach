@@ -8,14 +8,17 @@ RUN apk add --no-cache git ca-certificates
 
 WORKDIR /build
 
-# Copy only go.mod first
+# Copy go.mod first
 COPY src/go.mod ./go.mod
 
-# Download dependencies (this will create go.sum automatically)
+# Initialize with basic download
 RUN go mod download
 
 # Copy all source files
 COPY src/*.go ./
+
+# Run go mod tidy to add missing dependencies
+RUN go mod tidy
 
 # Build the binary with optimizations
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v \
