@@ -163,8 +163,8 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	labels := containerInfo.Config.Labels
 	
-	// Extract network labels
-	networkLabels := m.extractNetworkLabels(labels)
+	// Extract network labels and their internal flags
+	networkLabels := m.extractNetworkLabelsWithInternal(labels)
 	
 	// If no network labels, skip management
 	if len(networkLabels) == 0 {
@@ -180,9 +180,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	// Check if we should disconnect default network
 	shouldDisconnectDefault := m.shouldDisconnectDefault(labels)
-	
-	// Check if internal networks should be created
-	isInternal := m.isInternalNetwork(labels)
 
 	// Get currently connected networks
 	currentNetworks := make(map[string]bool)
@@ -190,10 +187,10 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		currentNetworks[netName] = true
 	}
 
-	// Ensure all labeled networks exist and are connected
-	for netName := range networkLabels {
-		// Create network if it doesn't exist
-		if err := m.ensureNetworkExists(ctx, netName, isInternal); err != nil {
+	// Ensure all labeled networks exist with proper internal flag and are connected
+	for netName, isInternal := range networkLabels {
+		// Ensure network exists and convert to internal if needed
+		if err := m.ensureNetworkExistsWithInternalFlag(ctx, netName, isInternal); err != nil {
 			log.Printf("Error ensuring network %s exists: %v", netName, err)
 			continue
 		}
@@ -229,8 +226,8 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	return nil
 }
 
-func (m *NetworkManager) extractNetworkLabels(labels map[string]string) map[string]bool {
-	networks := make(map[string]bool)
+func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]string) map[string]bool {
+	networks := make(map[string]bool) // network name -> is internal
 	
 	for key, value := range labels {
 		if !strings.HasPrefix(key, m.labelPrefix) {
@@ -241,27 +238,47 @@ func (m *NetworkManager) extractNetworkLabels(labels map[string]string) map[stri
 		suffix := strings.TrimPrefix(key, m.labelPrefix)
 		
 		// Skip special keys
-		if suffix == m.disconnectDefaultKey || suffix == m.internalKey {
+		if suffix == m.disconnectDefaultKey {
 			continue
 		}
 
-		// Check if label is set to true
+		// Check for network.internal pattern
+		if strings.HasSuffix(suffix, "."+m.internalKey) {
+			// Extract network name
+			netName := strings.TrimSuffix(suffix, "."+m.internalKey)
+			if strings.ToLower(value) == "true" {
+				// Mark this network as internal
+				networks[netName] = true
+			}
+			continue
+		}
+
+		// Regular network label
 		if strings.ToLower(value) == "true" {
-			networks[suffix] = true
+			// If not already marked as internal, mark as non-internal
+			if _, exists := networks[suffix]; !exists {
+				networks[suffix] = false
+			}
 		}
 	}
 
 	return networks
 }
 
-func (m *NetworkManager) shouldDisconnectDefault(labels map[string]string) bool {
-	key := m.labelPrefix + m.disconnectDefaultKey
-	value, exists := labels[key]
-	return exists && strings.ToLower(value) == "true"
+// Legacy function kept for backward compatibility
+func (m *NetworkManager) extractNetworkLabels(labels map[string]string) map[string]bool {
+	networks := make(map[string]bool)
+	networksWithInternal := m.extractNetworkLabelsWithInternal(labels)
+	
+	for netName := range networksWithInternal {
+		networks[netName] = true
+	}
+	
+	return networks
 }
 
-func (m *NetworkManager) isInternalNetwork(labels map[string]string) bool {
-	key := m.labelPrefix + m.internalKey
+func (m *NetworkManager) shouldDisconnectDefault(labels map[string]string) bool {
+	key := m.labelPrefix + m.disconnectDefaultKey
 	value, exists := labels[key]
 	return exists && strings.ToLower(value) == "true"
 }
@@ -282,7 +299,7 @@ func (m *NetworkManager) isDefaultNetwork(netName string, containerInfo types.Co
 	return false
 }
 
-func (m *NetworkManager) ensureNetworkExists(ctx context.Context, networkName string, internal bool) error {
+func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context, networkName string, shouldBeInternal bool) error {
 	// Check if network exists
 	networks, err := m.client.NetworkList(ctx, network.ListOptions{
 		Filters: filters.NewArgs(filters.Arg("name", networkName)),
@@ -291,26 +308,133 @@ func (m *NetworkManager) ensureNetworkExists(ctx context.Context, networkName st
 		return fmt.Errorf("failed to list networks: %w", err)
 	}
 
-	// Network exists, verify it's the right one (exact match)
-	for _, net := range networks {
+	// Find exact match
+	var existingNetwork *network.Summary
+	for i, net := range networks {
 		if net.Name == networkName {
-			return nil
+			existingNetwork = &networks[i]
+			break
 		}
 	}
 
-	// Create network
-	log.Printf("Creating network %s (internal: %v)", networkName, internal)
+	// Network doesn't exist - create it
+	if existingNetwork == nil {
+		log.Printf("Creating network %s (internal: %v)", networkName, shouldBeInternal)
+		
+		_, err = m.client.NetworkCreate(ctx, networkName, network.CreateOptions{
+			Driver:   "bridge",
+			Internal: shouldBeInternal,
+			Labels: map[string]string{
+				"managed-by": "docker-network-manager",
+			},
+		})
+		
+		if err != nil {
+			return fmt.Errorf("failed to create network: %w", err)
+		}
+		return nil
+	}
+
+	// Network exists - check if we need to convert internal flag
+	currentlyInternal := existingNetwork.Internal
 	
-	_, err = m.client.NetworkCreate(ctx, networkName, network.CreateOptions{
-		Driver:   "bridge",
-		Internal: internal,
-		Labels: map[string]string{
-			"managed-by": "docker-network-manager",
-		},
-	})
-	
-	if err != nil {
-		return fmt.Errorf("failed to create network: %w", err)
+	if currentlyInternal != shouldBeInternal {
+		log.Printf("Network %s needs internal flag conversion: %v -> %v", networkName, currentlyInternal, shouldBeInternal)
+		
+		// Get detailed network info to see connected containers
+		netDetails, err := m.client.NetworkInspect(ctx, existingNetwork.ID, network.InspectOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to inspect network: %w", err)
+		}
+
+		// Collect containers that need to be reconnected
+		containersToReconnect := make([]string, 0)
+		for containerID := range netDetails.Containers {
+			containersToReconnect = append(containersToReconnect, containerID)
+		}
+
+		// If there are containers, we need to handle them carefully
+		if len(containersToReconnect) > 0 {
+			log.Printf("Network %s has %d connected containers, preparing safe conversion...", networkName, len(containersToReconnect))
+			
+			// Create temporary bridge network as safety net
+			tempNetworkName := "temp-safety-" + networkName
+			log.Printf("Creating temporary safety network: %s", tempNetworkName)
+			
+			tempNet, err := m.client.NetworkCreate(ctx, tempNetworkName, network.CreateOptions{
+				Driver: "bridge",
+				Labels: map[string]string{
+					"managed-by": "docker-network-manager",
+					"temporary":  "true",
+				},
+			})
+			if err != nil {
+				log.Printf("Warning: Failed to create temporary network: %v", err)
+				// Continue anyway, containers might have other networks
+			}
+
+			// Connect all containers to temp network first
+			if tempNet.ID != "" {
+				for _, containerID := range containersToReconnect {
+					log.Printf("Connecting container %s to temporary network", containerID[:12])
+					if err := m.client.NetworkConnect(ctx, tempNet.ID, containerID, nil); err != nil {
+						log.Printf("Warning: Failed to connect container %s to temp network: %v", containerID[:12], err)
+					}
+				}
+			}
+
+			// Disconnect all containers from the original network
+			for _, containerID := range containersToReconnect {
+				log.Printf("Disconnecting container %s from network %s", containerID[:12], networkName)
+				if err := m.client.NetworkDisconnect(ctx, existingNetwork.ID, containerID, false); err != nil {
+					log.Printf("Warning: Failed to disconnect container %s: %v", containerID[:12], err)
+				}
+			}
+		}
+
+		// Remove the old network
+		log.Printf("Removing network %s for recreation", networkName)
+		if err := m.client.NetworkRemove(ctx, existingNetwork.ID); err != nil {
+			return fmt.Errorf("failed to remove network for conversion: %w", err)
+		}
+
+		// Recreate with new internal flag
+		log.Printf("Recreating network %s with internal=%v", networkName, shouldBeInternal)
+		newNet, err := m.client.NetworkCreate(ctx, networkName, network.CreateOptions{
+			Driver:   "bridge",
+			Internal: shouldBeInternal,
+			Labels: map[string]string{
+				"managed-by": "docker-network-manager",
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to recreate network: %w", err)
+		}
+
+		// Reconnect all containers to the new network
+		for _, containerID := range containersToReconnect {
+			log.Printf("Reconnecting container %s to network %s", containerID[:12], networkName)
+			if err := m.client.NetworkConnect(ctx, newNet.ID, containerID, nil); err != nil {
+				log.Printf("Error reconnecting container %s: %v", containerID[:12], err)
+			}
+		}
+
+		// Clean up temporary network
+		if len(containersToReconnect) > 0 {
+			tempNetworkName := "temp-safety-" + networkName
+			// Disconnect all containers from temp network
+			for _, containerID := range containersToReconnect {
+				m.client.NetworkDisconnect(ctx, tempNetworkName, containerID, false)
+			}
+			// Remove temp network
+			if err := m.client.NetworkRemove(ctx, tempNetworkName); err != nil {
+				log.Printf("Warning: Failed to cleanup temporary network %s: %v", tempNetworkName, err)
+			} else {
+				log.Printf("Cleaned up temporary network: %s", tempNetworkName)
+			}
+		}
+
+		log.Printf("Successfully converted network %s to internal=%v", networkName, shouldBeInternal)
 	}
 
 	return nil
