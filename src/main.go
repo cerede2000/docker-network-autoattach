@@ -217,14 +217,22 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 	case "start", "update":
 		time.Sleep(500 * time.Millisecond)
 		
-		log.Printf("Event: %s for container %s", event.Action, event.ID[:12])
+		// Récupérer le nom du container pour le log
+		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
+		containerName := event.ID[:12] // Fallback sur l'ID
+		if err == nil && containerInfo.Name != "" {
+			containerName = containerInfo.Name
+		}
+		
+		log.Printf("Event: %s for container %s (%s)", event.Action, containerName, event.ID[:12])
 		
 		// Optimisation : traiter SEULEMENT le container concerné
 		if err := m.reconcileContainerWithConflictDetection(ctx, event.ID); err != nil {
-			log.Printf("Error reconciling container %s: %v", event.ID[:12], err)
+			log.Printf("Error reconciling container %s (%s): %v", containerName, event.ID[:12], err)
 		}
 		
 	case "die":
+		// Récupérer le nom du container avant suppression
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
 		containerName := event.ID[:12]
 		if err == nil && containerInfo.Name != "" {
@@ -248,6 +256,9 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		return fmt.Errorf("failed to inspect container: %w", err)
 	}
 
+	containerName := containerInfo.Name
+	shortID := containerID[:12]
+
 	if !containerInfo.State.Running {
 		return nil
 	}
@@ -268,8 +279,8 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 	for netName, wantInternal := range networkLabels {
 		if existingInternal, exists := m.networkInternalState[netName]; exists {
 			if existingInternal != wantInternal {
-				log.Printf("⚠️  CONFLICT detected for network %s: existing=%v, requested=%v", 
-					netName, existingInternal, wantInternal)
+				log.Printf("⚠️  CONFLICT detected for network %s: existing=%v, requested=%v (container: %s)", 
+					netName, existingInternal, wantInternal, containerName)
 				hasConflict = true
 			}
 		}
@@ -278,7 +289,8 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 
 	// Si conflit détecté, faire une réconciliation complète
 	if hasConflict {
-		log.Printf("Conflict detected, triggering full reconciliation...")
+		log.Printf("Conflict detected for container %s (%s), triggering full reconciliation...", 
+			containerName, shortID)
 		return m.reconcileAllContainers(ctx)
 	}
 
