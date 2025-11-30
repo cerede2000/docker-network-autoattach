@@ -23,7 +23,7 @@ const (
 	defaultDisconnectOthersKey   = "disconnectothers"
 	defaultInternalKey           = "internal"
 	defaultReconciliationInterval = 30 * time.Second
-	defaultDisconnectOthersDefault = false // Par défaut : garde les autres réseaux
+	defaultDisconnectOthersDefault = false
 )
 
 type NetworkManager struct {
@@ -32,10 +32,11 @@ type NetworkManager struct {
 	disconnectOthersKey    string
 	internalKey            string
 	reconciliationInterval time.Duration
-	disconnectOthersDefault bool // Comportement par défaut si le label n'est pas présent
+	disconnectOthersDefault bool
 	mu                     sync.RWMutex
 	managedContainers      map[string]bool
 	networkInternalState   map[string]bool
+	reconciliationMutex    sync.Mutex // Empêche les réconciliations simultanées
 }
 
 func main() {
@@ -119,6 +120,10 @@ func (m *NetworkManager) periodicReconciliation(ctx context.Context) {
 }
 
 func (m *NetworkManager) reconcileAllContainers(ctx context.Context) error {
+	// Empêcher les réconciliations simultanées
+	m.reconciliationMutex.Lock()
+	defer m.reconciliationMutex.Unlock()
+
 	containers, err := m.client.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
@@ -214,15 +219,25 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		
 		log.Printf("Event: %s for container %s", event.Action, event.ID[:12])
 		
+		// Trigger full reconciliation (le mutex empêchera les doublons)
 		if err := m.reconcileAllContainers(ctx); err != nil {
 			log.Printf("Error during event reconciliation: %v", err)
 		}
 		
 	case "die":
+		// Récupérer le nom du container avant suppression
+		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
+		containerName := event.ID[:12] // Fallback sur l'ID court
+		if err == nil && containerInfo.Name != "" {
+			containerName = containerInfo.Name
+		}
+		
 		m.mu.Lock()
 		delete(m.managedContainers, event.ID)
 		m.mu.Unlock()
-		log.Printf("Container %s stopped, removed from managed list", event.ID[:12])
+		
+		log.Printf("Container %s (%s) stopped, removed from managed list", 
+			containerName, event.ID[:12])
 	}
 }
 
@@ -349,11 +364,9 @@ func (m *NetworkManager) shouldDisconnectOthers(labels map[string]string) bool {
 	value, exists := labels[key]
 	
 	if exists {
-		// Si le label est présent, on utilise sa valeur
 		return strings.ToLower(value) == "true"
 	}
 	
-	// Si le label n'est pas présent, on utilise la valeur par défaut
 	return m.disconnectOthersDefault
 }
 
