@@ -248,6 +248,7 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	}
 
 	containerName := containerInfo.Name
+	shortID := containerID[:12]
 	
 	if !containerInfo.State.Running {
 		return nil
@@ -276,7 +277,7 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	m.mu.RUnlock()
 
 	log.Printf("Managing container %s (%s) - Networks: %v", 
-		containerName, containerID[:12], getNetworkNames(resolvedNetworks))
+		containerName, shortID, getNetworkNames(resolvedNetworks))
 
 	m.mu.Lock()
 	m.managedContainers[containerID] = true
@@ -298,11 +299,12 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		}
 
 		if !currentNetworks[netName] {
-			log.Printf("Connecting container %s to network %s", containerID[:12], netName)
+			log.Printf("Connecting container %s (%s) to network %s", 
+				containerName, shortID, netName)
 			if err := m.client.NetworkConnect(ctx, netName, containerID, nil); err != nil {
 				if !strings.Contains(err.Error(), "already exists in network") {
-					log.Printf("Error connecting container %s to network %s: %v", 
-						containerID[:12], netName, err)
+					log.Printf("Error connecting container %s (%s) to network %s: %v", 
+						containerName, shortID, netName, err)
 				}
 			}
 		}
@@ -313,12 +315,12 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 	// Disconnect from OTHER networks if requested
 	if shouldDisconnectOthers {
 		for netName := range currentNetworks {
-			log.Printf("Disconnecting container %s from unmanaged network %s", 
-				containerID[:12], netName)
+			log.Printf("Disconnecting container %s (%s) from unmanaged network %s", 
+				containerName, shortID, netName)
 			if err := m.client.NetworkDisconnect(ctx, netName, containerID, false); err != nil {
 				if !strings.Contains(err.Error(), "is not connected to") {
-					log.Printf("Error disconnecting container %s from network %s: %v", 
-						containerID[:12], netName, err)
+					log.Printf("Error disconnecting container %s (%s) from network %s: %v", 
+						containerName, shortID, netName, err)
 				}
 			}
 		}
