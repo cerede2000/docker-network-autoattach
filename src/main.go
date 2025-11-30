@@ -36,7 +36,7 @@ type NetworkManager struct {
 	mu                     sync.RWMutex
 	managedContainers      map[string]bool
 	networkInternalState   map[string]bool
-	reconciliationMutex    sync.Mutex // Empêche les réconciliations simultanées
+	reconciliationMutex    sync.Mutex
 }
 
 func main() {
@@ -219,15 +219,14 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		
 		log.Printf("Event: %s for container %s", event.Action, event.ID[:12])
 		
-		// Trigger full reconciliation (le mutex empêchera les doublons)
-		if err := m.reconcileAllContainers(ctx); err != nil {
-			log.Printf("Error during event reconciliation: %v", err)
+		// Optimisation : traiter SEULEMENT le container concerné
+		if err := m.reconcileContainerWithConflictDetection(ctx, event.ID); err != nil {
+			log.Printf("Error reconciling container %s: %v", event.ID[:12], err)
 		}
 		
 	case "die":
-		// Récupérer le nom du container avant suppression
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
-		containerName := event.ID[:12] // Fallback sur l'ID court
+		containerName := event.ID[:12]
 		if err == nil && containerInfo.Name != "" {
 			containerName = containerInfo.Name
 		}
@@ -239,6 +238,59 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 		log.Printf("Container %s (%s) stopped, removed from managed list", 
 			containerName, event.ID[:12])
 	}
+}
+
+// Nouvelle fonction : réconcilie un container ET détecte les conflits
+func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Context, containerID string) error {
+	// Inspecter le container
+	containerInfo, err := m.client.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("failed to inspect container: %w", err)
+	}
+
+	if !containerInfo.State.Running {
+		return nil
+	}
+
+	labels := containerInfo.Config.Labels
+	networkLabels := m.extractNetworkLabelsWithInternal(labels)
+	
+	if len(networkLabels) == 0 {
+		m.mu.Lock()
+		delete(m.managedContainers, containerID)
+		m.mu.Unlock()
+		return nil
+	}
+
+	// Vérifier s'il y a des conflits avec les réseaux existants
+	hasConflict := false
+	m.mu.RLock()
+	for netName, wantInternal := range networkLabels {
+		if existingInternal, exists := m.networkInternalState[netName]; exists {
+			if existingInternal != wantInternal {
+				log.Printf("⚠️  CONFLICT detected for network %s: existing=%v, requested=%v", 
+					netName, existingInternal, wantInternal)
+				hasConflict = true
+			}
+		}
+	}
+	m.mu.RUnlock()
+
+	// Si conflit détecté, faire une réconciliation complète
+	if hasConflict {
+		log.Printf("Conflict detected, triggering full reconciliation...")
+		return m.reconcileAllContainers(ctx)
+	}
+
+	// Pas de conflit : mettre à jour le cache et réconcilier ce container uniquement
+	m.mu.Lock()
+	for netName, isInternal := range networkLabels {
+		m.networkInternalState[netName] = isInternal
+	}
+	m.mu.Unlock()
+
+	// Réconcilier uniquement ce container
+	return m.reconcileContainer(ctx, containerID)
 }
 
 func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID string) error {
