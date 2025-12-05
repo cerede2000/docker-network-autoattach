@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -43,7 +44,6 @@ type NetworkManager struct {
 }
 
 func main() {
-	// Seed rand for non-deterministic run IDs
 	rand.Seed(time.Now().UnixNano())
 
 	log.Println("Starting Docker Network Manager...")
@@ -98,7 +98,7 @@ func main() {
 
 	go manager.periodicReconciliation(ctx)
 
-	// Watch network connect/disconnect as a second safety net
+	// Second safety net: watch network connect/disconnect
 	go func() {
 		log.Println("Starting network event watcher...")
 		if err := manager.watchNetworkEvents(ctx); err != nil && ctx.Err() == nil {
@@ -136,7 +136,6 @@ func (m *NetworkManager) periodicReconciliation(ctx context.Context) {
 }
 
 func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID string) error {
-	// Prevent simultaneous reconciliations
 	m.reconciliationMutex.Lock()
 	defer m.reconciliationMutex.Unlock()
 
@@ -172,12 +171,10 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID strin
 		}
 	}
 
-	// Update network internal state cache
 	m.mu.Lock()
 	m.networkInternalState = networkRequirements
 	m.mu.Unlock()
 
-	// Second pass: reconcile containers with resolved network states
 	managedCount := 0
 	skippedCount := 0
 	errorCount := 0
@@ -210,8 +207,7 @@ func (m *NetworkManager) reconcileAllContainers(ctx context.Context, runID strin
 func (m *NetworkManager) watchContainerEvents(ctx context.Context) error {
 	filter := filters.NewArgs()
 	filter.Add("type", "container")
-	// Critical: reconcile on create to ensure networks are correct BEFORE start
-	filter.Add("event", "create")
+	filter.Add("event", "create") // KEY FIX
 	filter.Add("event", "start")
 	filter.Add("event", "die")
 	filter.Add("event", "update")
@@ -265,7 +261,6 @@ func (m *NetworkManager) watchNetworkEvents(ctx context.Context) error {
 				return fmt.Errorf("network event stream closed")
 			}
 
-			// Docker network events often provide container ID in Actor.Attributes
 			cid := event.Actor.Attributes["container"]
 			if cid == "" {
 				continue
@@ -274,9 +269,7 @@ func (m *NetworkManager) watchNetworkEvents(ctx context.Context) error {
 			runID := generateRunID()
 			log.Printf("[%s] Network event: %s for container %s", runID, event.Action, shortID(cid))
 
-			// Reconcile the impacted container only
 			go func(containerID string, rid string) {
-				// Small delay to let Docker finalize attachments
 				time.Sleep(150 * time.Millisecond)
 				if err := m.reconcileContainerWithConflictDetection(ctx, containerID, rid); err != nil {
 					log.Printf("[%s] Error reconciling after network event for %s: %v", rid, shortID(containerID), err)
@@ -303,7 +296,7 @@ func (m *NetworkManager) handleContainerEvent(ctx context.Context, event events.
 	switch event.Action {
 
 	case "create":
-		// Important: no sleep here. We want networks fixed BEFORE start.
+		// No sleep: fix networks BEFORE start
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
 		containerName := shortID(event.ID)
 		if err == nil && containerInfo.Name != "" {
@@ -317,7 +310,6 @@ func (m *NetworkManager) handleContainerEvent(ctx context.Context, event events.
 		}
 
 	case "start", "update":
-		// A tiny delay helps absorb Docker/Compose timing jitter
 		time.Sleep(400 * time.Millisecond)
 
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
@@ -328,7 +320,6 @@ func (m *NetworkManager) handleContainerEvent(ctx context.Context, event events.
 
 		log.Printf("[%s] Event: %s for container %s (%s)", runID, event.Action, containerName, shortID(event.ID))
 
-		// Reconcile only the impacted container
 		if err := m.reconcileContainerWithConflictDetection(ctx, event.ID, runID); err != nil {
 			log.Printf("[%s] Error reconciling container %s (%s): %v", runID, containerName, shortID(event.ID), err)
 		}
@@ -349,23 +340,17 @@ func (m *NetworkManager) handleContainerEvent(ctx context.Context, event events.
 	}
 }
 
-// reconcile one container and detect conflicts.
-// If conflict between desired internal flag & global cache, trigger full reconciliation.
+//
+// --- Reconciliation logic ---
+//
+
 func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Context, containerID string, runID string) error {
-	// Avoid conflicts with periodic loop
 	m.reconciliationMutex.Lock()
 	defer m.reconciliationMutex.Unlock()
 
 	containerInfo, err := m.client.ContainerInspect(ctx, containerID)
 	if err != nil {
 		return fmt.Errorf("failed to inspect container: %w", err)
-	}
-
-	if containerInfo.State == nil || !containerInfo.State.Running {
-		// Note: we still want labels on create BEFORE start.
-		// But Docker inspect on create usually shows State with Running=false.
-		// We still can manage networks even if not running.
-		// So we DON'T early-return on create path in reconcileContainer().
 	}
 
 	labels := containerInfo.Config.Labels
@@ -378,7 +363,6 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		return nil
 	}
 
-	// Check conflicts
 	hasConflict := false
 	m.mu.RLock()
 	for netName, wantInternal := range networkLabels {
@@ -396,14 +380,12 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		log.Printf("[%s] Conflict detected for container %s (%s), triggering full reconciliation...",
 			runID, containerInfo.Name, shortID(containerID))
 
-		// Release lock before calling full reconciliation
 		m.reconciliationMutex.Unlock()
 		err := m.reconcileAllContainers(ctx, runID)
-		m.reconciliationMutex.Lock() // re-lock for defer
+		m.reconciliationMutex.Lock()
 		return err
 	}
 
-	// Update cache for networks referenced by this container
 	m.mu.Lock()
 	for netName, isInternal := range networkLabels {
 		m.networkInternalState[netName] = isInternal
@@ -432,7 +414,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		return nil
 	}
 
-	// Use global network state
 	m.mu.RLock()
 	resolvedNetworks := make(map[string]bool)
 	for netName := range networkLabels {
@@ -453,7 +434,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	shouldDisconnectOthers := m.shouldDisconnectOthers(labels)
 
-	// Collect currently connected networks
 	currentNetworks := make(map[string]bool)
 	if containerInfo.NetworkSettings != nil {
 		for netName := range containerInfo.NetworkSettings.Networks {
@@ -463,7 +443,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	networksChanged := false
 
-	// Ensure all labeled networks exist and are connected
 	for netName, isInternal := range resolvedNetworks {
 		if err := m.ensureNetworkExistsWithInternalFlag(ctx, netName, isInternal, runID); err != nil {
 			log.Printf("[%s] Error ensuring network %s exists: %v", runID, netName, err)
@@ -487,7 +466,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		delete(currentNetworks, netName)
 	}
 
-	// Disconnect from OTHER networks if requested
 	if shouldDisconnectOthers {
 		for netName := range currentNetworks {
 			log.Printf("[%s] Disconnecting container %s (%s) from unmanaged network %s",
@@ -504,8 +482,6 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		}
 	}
 
-	// If networks changed, try to force a REAL update event
-	// so watchers like Traefik re-evaluate the container.
 	if networksChanged {
 		log.Printf("[%s] Networks changed for container %s (%s), forcing real update event",
 			runID, containerName, short)
@@ -515,6 +491,10 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 
 	return nil
 }
+
+//
+// --- Labels helpers ---
+//
 
 func (m *NetworkManager) extractNetworkLabelsWithInternal(labels map[string]string) map[string]bool {
 	networks := make(map[string]bool)
@@ -559,9 +539,12 @@ func (m *NetworkManager) shouldDisconnectOthers(labels map[string]string) bool {
 	return m.disconnectOthersDefault
 }
 
-// Force a REAL update event by toggling restart policy briefly.
-// This should not restart the container, but will generate a meaningful update.
-func (m *NetworkManager) forceRealUpdateEvent(ctx context.Context, containerInfo container.InspectResponse, containerID string, runID string) {
+//
+// --- Force real update event ---
+//
+
+// FIX: ContainerInspect returns types.ContainerJSON, not container.InspectResponse.
+func (m *NetworkManager) forceRealUpdateEvent(ctx context.Context, containerInfo types.ContainerJSON, containerID string, runID string) {
 	if containerInfo.HostConfig == nil {
 		return
 	}
@@ -575,7 +558,6 @@ func (m *NetworkManager) forceRealUpdateEvent(ctx context.Context, containerInfo
 		temp.Name = "unless-stopped"
 	}
 
-	// 1) Apply temporary policy
 	if _, err := m.client.ContainerUpdate(ctx, containerID, container.UpdateConfig{
 		RestartPolicy: temp,
 	}); err != nil {
@@ -584,7 +566,6 @@ func (m *NetworkManager) forceRealUpdateEvent(ctx context.Context, containerInfo
 		return
 	}
 
-	// 2) Restore original policy
 	if _, err := m.client.ContainerUpdate(ctx, containerID, container.UpdateConfig{
 		RestartPolicy: orig,
 	}); err != nil {
@@ -596,6 +577,10 @@ func (m *NetworkManager) forceRealUpdateEvent(ctx context.Context, containerInfo
 	log.Printf("[%s] Successfully forced update event for container %s",
 		runID, shortID(containerID))
 }
+
+//
+// --- Network ensure/convert ---
+//
 
 func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context, networkName string, shouldBeInternal bool, runID string) error {
 	networks, err := m.client.NetworkList(ctx, network.ListOptions{
@@ -646,7 +631,6 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 			containersToReconnect = append(containersToReconnect, containerID)
 		}
 
-		// Safety temporary network
 		var tempNetID string
 		tempNetworkName := "temp-safety-" + networkName
 
@@ -710,7 +694,6 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 			}
 		}
 
-		// Cleanup temp network
 		if len(containersToReconnect) > 0 && tempNetID != "" {
 			for _, containerID := range containersToReconnect {
 				_ = m.client.NetworkDisconnect(ctx, tempNetID, containerID, false)
@@ -729,7 +712,7 @@ func (m *NetworkManager) ensureNetworkExistsWithInternalFlag(ctx context.Context
 }
 
 //
-// --- Helpers ---
+// --- Misc helpers ---
 //
 
 func generateRunID() string {
