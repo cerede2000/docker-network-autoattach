@@ -18,10 +18,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -v \
     -ldflags='-w -s -extldflags "-static"' \
     -o docker-network-manager .
 
-FROM scratch
+# Runtime stage - using alpine instead of scratch for curl
+FROM alpine:latest
 
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /build/docker-network-manager /docker-network-manager
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
 
 USER 65534:65534
 
