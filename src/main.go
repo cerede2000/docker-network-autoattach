@@ -25,7 +25,8 @@ const (
 	defaultInternalKey             = "internal"
 	defaultReconciliationInterval  = 30 * time.Second
 	defaultDisconnectOthersDefault = false
-	defaultStartDelay              = 2 * time.Second // Délai avant de gérer les réseaux au démarrage
+	defaultRestartOnNetworkChange  = true
+	defaultRestartTimeout          = 1 // secondes
 )
 
 type NetworkManager struct {
@@ -35,7 +36,8 @@ type NetworkManager struct {
 	internalKey             string
 	reconciliationInterval  time.Duration
 	disconnectOthersDefault bool
-	startDelay              time.Duration
+	restartOnNetworkChange  bool
+	restartTimeout          int
 	mu                      sync.RWMutex
 	managedContainers       map[string]bool
 	networkInternalState    map[string]bool
@@ -56,7 +58,8 @@ func main() {
 	internalKey := getEnv("INTERNAL_KEY", defaultInternalKey)
 	reconciliationInterval := getDurationEnv("RECONCILIATION_INTERVAL", defaultReconciliationInterval)
 	disconnectOthersDefault := getBoolEnv("DISCONNECT_OTHERS_DEFAULT", defaultDisconnectOthersDefault)
-	startDelay := getDurationEnv("START_DELAY", defaultStartDelay)
+	restartOnNetworkChange := getBoolEnv("RESTART_ON_NETWORK_CHANGE", defaultRestartOnNetworkChange)
+	restartTimeout := getIntEnv("RESTART_TIMEOUT", defaultRestartTimeout)
 
 	log.Printf("Configuration:")
 	log.Printf("  Label prefix: %s", labelPrefix)
@@ -64,7 +67,8 @@ func main() {
 	log.Printf("  Disconnect others default: %v", disconnectOthersDefault)
 	log.Printf("  Internal network suffix: .%s", internalKey)
 	log.Printf("  Reconciliation interval: %v", reconciliationInterval)
-	log.Printf("  Start delay: %v", startDelay)
+	log.Printf("  Restart on network change: %v", restartOnNetworkChange)
+	log.Printf("  Restart timeout: %ds", restartTimeout)
 
 	manager := &NetworkManager{
 		client:                  cli,
@@ -73,7 +77,8 @@ func main() {
 		internalKey:             internalKey,
 		reconciliationInterval:  reconciliationInterval,
 		disconnectOthersDefault: disconnectOthersDefault,
-		startDelay:              startDelay,
+		restartOnNetworkChange:  restartOnNetworkChange,
+		restartTimeout:          restartTimeout,
 		managedContainers:       make(map[string]bool),
 		networkInternalState:    make(map[string]bool),
 	}
@@ -224,36 +229,17 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 	runID := generateRunID()
 
 	switch event.Action {
-	case "start":
-		// Récupérer le nom du container pour le log
+	case "start", "update":
+		// Délai court pour laisser le container s'initialiser
+		time.Sleep(150 * time.Millisecond)
+
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
 		containerName := event.ID[:12]
 		if err == nil && containerInfo.Name != "" {
 			containerName = containerInfo.Name
 		}
 
-		log.Printf("[%s] Event: start for container %s (%s)", runID, containerName, event.ID[:12])
-
-		// CRUCIAL : Attendre avant de gérer les réseaux
-		// Cela laisse le temps à Traefik et autres services de faire leur scan initial
-		log.Printf("[%s] Waiting %v before managing networks for %s (%s)",
-			runID, m.startDelay, containerName, event.ID[:12])
-		time.Sleep(m.startDelay)
-
-		// Traiter le container
-		if err := m.reconcileContainerWithConflictDetection(ctx, event.ID, runID); err != nil {
-			log.Printf("[%s] Error reconciling container %s (%s): %v", runID, containerName, event.ID[:12], err)
-		}
-
-	case "update":
-		// Pour les updates, pas de délai (c'est un changement de config)
-		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
-		containerName := event.ID[:12]
-		if err == nil && containerInfo.Name != "" {
-			containerName = containerInfo.Name
-		}
-
-		log.Printf("[%s] Event: update for container %s (%s)", runID, containerName, event.ID[:12])
+		log.Printf("[%s] Event: %s for container %s (%s)", runID, event.Action, containerName, event.ID[:12])
 
 		if err := m.reconcileContainerWithConflictDetection(ctx, event.ID, runID); err != nil {
 			log.Printf("[%s] Error reconciling container %s (%s): %v", runID, containerName, event.ID[:12], err)
@@ -275,13 +261,11 @@ func (m *NetworkManager) handleEvent(ctx context.Context, event events.Message) 
 	}
 }
 
-// Nouvelle fonction : réconcilie un container ET détecte les conflits
 func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Context, containerID string, runID string) error {
 	// Acquérir le mutex pour éviter les conflits avec la loop périodique
 	m.reconciliationMutex.Lock()
 	defer m.reconciliationMutex.Unlock()
 
-	// Inspecter le container
 	containerInfo, err := m.client.ContainerInspect(ctx, containerID)
 	if err != nil {
 		return fmt.Errorf("failed to inspect container: %w", err)
@@ -323,10 +307,9 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 		log.Printf("[%s] Conflict detected for container %s (%s), triggering full reconciliation...",
 			runID, containerName, shortID)
 
-		// Libérer le mutex avant d'appeler reconcileAllContainers (qui va le reprendre)
 		m.reconciliationMutex.Unlock()
 		err := m.reconcileAllContainers(ctx, runID)
-		m.reconciliationMutex.Lock() // Re-lock pour le defer
+		m.reconciliationMutex.Lock()
 		return err
 	}
 
@@ -337,7 +320,6 @@ func (m *NetworkManager) reconcileContainerWithConflictDetection(ctx context.Con
 	}
 	m.mu.Unlock()
 
-	// Réconcilier uniquement ce container
 	return m.reconcileContainer(ctx, containerID, runID)
 }
 
@@ -433,10 +415,27 @@ func (m *NetworkManager) reconcileContainer(ctx context.Context, containerID str
 		}
 	}
 
-	// Si des réseaux ont changé, simplement logger - Traefik détectera automatiquement
+	// Si des réseaux ont changé ET que le container a traefik.enable=true, restart pour forcer Traefik à rescanner
 	if networksChanged {
-		log.Printf("[%s] Networks changed for container %s (%s) - services like Traefik will detect automatically",
-			runID, containerName, shortID)
+		traefikEnabled := strings.ToLower(labels["traefik.enable"]) == "true"
+		
+		if traefikEnabled && m.restartOnNetworkChange {
+			log.Printf("[%s] Networks changed for container %s (%s) with Traefik enabled, performing quick restart",
+				runID, containerName, shortID)
+			
+			// Restart rapide avec timeout court
+			timeout := m.restartTimeout
+			if err := m.client.ContainerRestart(ctx, containerID, container.StopOptions{Timeout: &timeout}); err != nil {
+				log.Printf("[%s] Warning: Failed to restart container %s (%s): %v",
+					runID, containerName, shortID, err)
+			} else {
+				log.Printf("[%s] Successfully restarted container %s (%s) - Traefik will rescan",
+					runID, containerName, shortID)
+			}
+		} else {
+			log.Printf("[%s] Networks changed for container %s (%s)",
+				runID, containerName, shortID)
+		}
 	}
 
 	return nil
@@ -642,6 +641,16 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 func getBoolEnv(key string, defaultValue bool) bool {
 	if value := os.Getenv(key); value != "" {
 		return strings.ToLower(value) == "true"
+	}
+	return defaultValue
+}
+
+func getIntEnv(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		var result int
+		if _, err := fmt.Sscanf(value, "%d", &result); err == nil {
+			return result
+		}
 	}
 	return defaultValue
 }
