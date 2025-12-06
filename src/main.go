@@ -275,7 +275,7 @@ func (m *NetworkManager) watchNetworkEvents(ctx context.Context) error {
 			log.Printf("[%s] Network event: %s for container %s", runID, event.Action, shortID(cid))
 
 			go func(containerID string, rid string) {
-				time.Sleep(150 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				if err := m.reconcileContainerWithConflictDetection(ctx, containerID, rid); err != nil {
 					log.Printf("[%s] Error reconciling after network event for %s: %v", rid, shortID(containerID), err)
 				}
@@ -315,7 +315,7 @@ func (m *NetworkManager) handleContainerEvent(ctx context.Context, event events.
 		}
 
 	case "start", "update":
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 
 		containerInfo, err := m.client.ContainerInspect(ctx, event.ID)
 		containerName := shortID(event.ID)
